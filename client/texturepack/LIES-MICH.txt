@@ -1,0 +1,17 @@
+Offizielles Minecraft-Texture-Pack verwenden
+============================================
+
+1. Ressourcen-Pack (.zip) besorgen (z. B. das Standard-Pack "VanillaDefault"
+   oder ein beliebiges 16x-Pack).
+2. Die Zip HIER in diesen Ordner entpacken, sodass danach dieser Pfad existiert:
+
+   texturepack/assets/minecraft/textures/block/stone.png
+
+   (Auch alte Packs mit "textures/blocks/..." funktionieren.)
+
+3. Spiel neu laden (F5). In der Browser-Konsole erscheint:
+   [Texturen] Texture-Pack geladen: NN Texturen übernommen
+
+Fehlt eine Textur, bleibt automatisch die eingebaute prozedurale Textur aktiv.
+Es werden Block-Texturen (textures/block/) und Item-Icons (textures/item/)
+verwendet. Mob-Modelle bleiben prozedural.

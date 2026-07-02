@@ -1,0 +1,15 @@
+[package]
+name = "claudemc-ws"
+version = "0.2.0"
+edition = "2021"
+
+[[bin]]
+name = "claudemc-ws"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.23"
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

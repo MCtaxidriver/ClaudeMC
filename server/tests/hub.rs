@@ -1,0 +1,126 @@
+// Integrationstest: startet den echten Server-Binary und prüft mit zwei
+// WebSocket-Clients Join/Welcome, Block-Relay, Snapshots und Late-Join-Journal.
+
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{json, Value};
+use std::process::{Child, Command};
+use std::time::Duration;
+use tokio_tungstenite::tungstenite::Message;
+
+struct ServerGuard(Child);
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+    }
+}
+
+type Ws = tokio_tungstenite::WebSocketStream<
+    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+>;
+
+async fn connect(port: u16) -> Ws {
+    for _ in 0..50 {
+        if let Ok((ws, _)) =
+            tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}")).await
+        {
+            return ws;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("Server nicht erreichbar");
+}
+
+async fn send(ws: &mut Ws, v: Value) {
+    ws.send(Message::Text(v.to_string())).await.unwrap();
+}
+
+// Nächste Nachricht mit t == want (überspringt andere, z. B. snap/time)
+async fn recv_type(ws: &mut Ws, want: &str) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let msg = tokio::time::timeout_at(deadline, ws.next())
+            .await
+            .expect("Timeout beim Warten")
+            .expect("Stream beendet")
+            .expect("WS-Fehler");
+        if let Message::Text(t) = msg {
+            let v: Value = serde_json::from_str(&t).unwrap();
+            if v["t"] == want {
+                return v;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn join_set_snapshot_and_late_join() {
+    let port = 39251;
+    let server = Command::new(env!("CARGO_BIN_EXE_claudemc-ws"))
+        .env("PORT", port.to_string())
+        .env("WORLD_SEED", "4242")
+        .spawn()
+        .unwrap();
+    let _guard = ServerGuard(server);
+
+    // Client A tritt bei
+    let mut a = connect(port).await;
+    send(&mut a, json!({"t":"join","name":"Alice"})).await;
+    let welcome_a = recv_type(&mut a, "welcome").await;
+    assert_eq!(welcome_a["seed"], 4242);
+    assert_eq!(welcome_a["players"].as_array().unwrap().len(), 0);
+    let pid_a = welcome_a["pid"].as_u64().unwrap();
+
+    // A meldet Position und setzt einen Block
+    send(&mut a, json!({"t":"pos","d":"over","x":10.5,"y":45.0,"z":-3.5,"yw":1.0,"pt":0.0})).await;
+    send(&mut a, json!({"t":"set","d":"over","x":10,"y":44,"z":-3,"id":1})).await;
+
+    // Ungültige Dimension und y=0 (Bedrock) dürfen das Journal nicht erreichen
+    send(&mut a, json!({"t":"set","d":"hack","x":0,"y":50,"z":0,"id":9})).await;
+    send(&mut a, json!({"t":"set","d":"over","x":0,"y":0,"z":0,"id":9})).await;
+
+    // Ping/Pong
+    send(&mut a, json!({"t":"ping","ts":123.0})).await;
+    assert_eq!(recv_type(&mut a, "pong").await["ts"], 123.0);
+
+    // Client B: Late-Join → Welcome muss A + Edit-Journal enthalten
+    let mut b = connect(port).await;
+    send(&mut b, json!({"t":"join","name":"Bob"})).await;
+    let welcome_b = recv_type(&mut b, "welcome").await;
+    let players = welcome_b["players"].as_array().unwrap();
+    assert_eq!(players.len(), 1);
+    assert_eq!(players[0]["name"], "Alice");
+    // Edit: x=10,y=44,z=-3 → Chunk 0,-1 · idx = (44*16 + (−3−(−16)))*16 + 10 = 11482
+    let edits = &welcome_b["edits"]["over"]["0,-1"];
+    assert_eq!(edits.as_array().unwrap().len(), 1);
+    assert_eq!(edits[0][0], 11482);
+    assert_eq!(edits[0][1], 1);
+    assert!(welcome_b["edits"]["hack"].is_null());
+    let pid_b = welcome_b["pid"].as_u64().unwrap();
+    assert_ne!(pid_a, pid_b);
+
+    // A bekommt PJoin für B
+    let pjoin = recv_type(&mut a, "pjoin").await;
+    assert_eq!(pjoin["name"], "Bob");
+
+    // B setzt einen Block → nur A bekommt das Relay (mit by = B)
+    send(&mut b, json!({"t":"set","d":"nether","x":-1,"y":30,"z":5,"id":21})).await;
+    let set = recv_type(&mut a, "set").await;
+    assert_eq!(set["d"], "nether");
+    assert_eq!(set["x"], -1);
+    assert_eq!(set["id"], 21);
+    assert_eq!(set["by"].as_u64().unwrap(), pid_b);
+
+    // Snapshots enthalten beide Spieler mit A's gemeldeter Position
+    let snap = recv_type(&mut b, "snap").await;
+    let arr = snap["p"].as_array().unwrap();
+    assert_eq!(arr.len(), 2);
+    let a_entry = arr.iter().find(|e| e[0].as_u64().unwrap() == pid_a).unwrap();
+    assert_eq!(a_entry[1], "over");
+    assert_eq!(a_entry[2], 10.5);
+    assert_eq!(a_entry[4], -3.5);
+
+    // A trennt → B bekommt PLeave
+    a.close(None).await.unwrap();
+    let pleave = recv_type(&mut b, "pleave").await;
+    assert_eq!(pleave["pid"].as_u64().unwrap(), pid_a);
+}
