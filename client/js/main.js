@@ -33,6 +33,8 @@ import { S, unlockAudio, applyVolume } from './sound.js';
 import { loadTexturePack } from './texpack.js';
 import { ViewModel, BreakOverlay } from './viewmodel.js';
 import { Menus } from './menu.js';
+import { Net, DEFAULT_SERVER } from './net.js';
+import { RemotePlayer } from './remoteplayer.js';
 
 // ============ Renderer & globale Ressourcen ============
 const canvas = document.getElementById('game');
@@ -148,6 +150,12 @@ let ambientTimer = 12;
 
 const params = new URLSearchParams(location.search);
 
+// ============ Multiplayer-Netzwerk ============
+// Fest verdrahteter Live-Server; ?server=ws://localhost:8080 übersteuert für Tests.
+const SERVER_URL = params.get('server') || DEFAULT_SERVER;
+const net = new Net();
+const remotePlayers = new Map(); // pid -> RemotePlayer
+
 function makeScene() {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x000000);
@@ -216,7 +224,7 @@ function createDim(name) {
   const { scene, hemi, sun } = makeScene();
   const world = new World(scene, opaqueMat, transMat, game.seed, name);
   if (game.savedEdits && game.savedEdits[name]) world.loadEdits(game.savedEdits[name]);
-  world.onBlockChange = (x, y, z) => onBlockChanged(name, x, y, z);
+  world.onBlockChange = (x, y, z, id) => onBlockChanged(name, x, y, z, id);
   const dim = {
     name, scene, world, entities: [], hemi, sun, sky: null,
     crystalsSpawned: false,
@@ -234,6 +242,10 @@ function createDim(name) {
     }
     game.savedDrops[name] = null;
   }
+  // Mitspieler, die sich bereits in dieser Dimension befinden, einhängen
+  for (const rp of remotePlayers.values()) {
+    if (rp.dim === name) rp.attach(scene);
+  }
   return dim;
 }
 
@@ -242,7 +254,9 @@ const curWorld = () => curDim().world;
 
 // Blockänderungen: Fluide aufwecken + Gravity-Blöcke prüfen
 const gravityQueue = [];
-function onBlockChanged(dimName, x, y, z) {
+function onBlockChanged(dimName, x, y, z, id) {
+  // Multiplayer: lokale Änderungen an den Hub melden (Remote-Sets nicht zurückspiegeln)
+  if (net.active && !net.applyingRemote && id !== undefined) net.sendSet(dimName, x, y, z, id);
   const dim = game && game.dims[dimName];
   if (!dim) return;
   dim.fluids.wake(x, y, z);
@@ -1448,6 +1462,7 @@ function renderDebug() {
   if (!game || debugMode === 0) { debugEl.textContent = ''; return; }
   const p = game.player;
   let text = `FPS ${fps.toFixed(0)}  ·  XYZ ${p.pos.x.toFixed(1)} / ${p.pos.y.toFixed(1)} / ${p.pos.z.toFixed(1)}`;
+  if (game.mp) text += `  ·  MP ${remotePlayers.size} Mitspieler${net.latency !== null ? ` · Ping ${net.latency.toFixed(0)} ms` : ''}`;
   if (debugMode >= 2) {
     const dimLabel = game.dimName === 'over' ? 'Overworld' : game.dimName === 'nether' ? 'Nether' : 'End';
     const tod = game.dimName === 'over' ? (isNight() ? 'Nacht' : 'Tag') : '';
@@ -1648,6 +1663,7 @@ function saveGame() {
 
 function quitToMenu() {
   saveGame();
+  netCleanup();
   for (const name of ['over', 'nether', 'end']) {
     const d = game.dims[name];
     if (!d) continue;
@@ -1664,6 +1680,116 @@ function quitToMenu() {
   renderHotbar();
   renderStatus();
   updateBossBar();
+}
+
+// ============ Multiplayer ============
+// Der Server liefert Seed, Weltzeit und das Edit-Journal; die Welt selbst wird
+// lokal deterministisch generiert. Alle MP-Pfade sind hinter game.mp/net.active
+// geschützt – der Singleplayer bleibt davon unberührt.
+
+function netCleanup() {
+  if (net.ws || net.active) net.disconnect();
+  for (const rp of remotePlayers.values()) rp.dispose();
+  remotePlayers.clear();
+}
+
+// Remote-Spieler in die Szene seiner Dimension hängen (falls lokal erzeugt)
+function syncRemotePlayerScene(rp) {
+  const dim = game && game.dims[rp.dim];
+  if (dim) rp.attach(dim.scene);
+  else rp.detach();
+}
+
+function addRemotePlayer(pid, name, info) {
+  if (pid === net.pid || remotePlayers.has(pid)) return;
+  const rp = new RemotePlayer(pid, name || 'Spieler ' + (pid + 1));
+  remotePlayers.set(pid, rp);
+  if (info) {
+    rp.setTarget(info.d, info.x, info.y, info.z, info.yw, info.pt);
+    syncRemotePlayerScene(rp);
+  }
+}
+
+function onSnapshot(list) {
+  if (!game || !game.mp) return;
+  for (const [pid, d, x, y, z, yw, pt] of list) {
+    if (pid === net.pid) continue;
+    let rp = remotePlayers.get(pid);
+    if (!rp) {
+      addRemotePlayer(pid, null, null);
+      rp = remotePlayers.get(pid);
+      if (!rp) continue;
+    }
+    const dimChanged = rp.setTarget(d, x, y, z, yw, pt);
+    if (dimChanged || !rp.scene) syncRemotePlayerScene(rp);
+  }
+}
+
+// Block-Update vom Server anwenden; Echo wird über applyingRemote unterdrückt.
+function applyRemoteSet(d, x, y, z, id) {
+  if (!game || !game.mp) return;
+  const dim = game.dims[d];
+  if (dim) {
+    net.applyingRemote = true;
+    try {
+      dim.world.setBlock(x, y, z, id);
+    } finally {
+      net.applyingRemote = false;
+    }
+  } else {
+    // Dimension lokal noch nicht erzeugt: ins Journal puffern,
+    // createDim() lädt es später über world.loadEdits().
+    if (!game.savedEdits) game.savedEdits = {};
+    const store = game.savedEdits[d] || (game.savedEdits[d] = {});
+    const cx = Math.floor(x / CS), cz = Math.floor(z / CS);
+    const key = cx + ',' + cz;
+    const idx = (y * CS + (z - cz * CS)) * CS + (x - cx * CS);
+    const arr = store[key] || (store[key] = []);
+    const existing = arr.find(e => e[0] === idx);
+    if (existing) existing[1] = id;
+    else arr.push([idx, id]);
+  }
+}
+
+function startMultiplayer(name) {
+  const status = el('mp-status');
+  status.textContent = 'Verbinde mit Server…';
+  net.connect(SERVER_URL, name, {
+    onWelcome: w => {
+      status.textContent = '';
+      startGame(undefined, 'survival', {
+        seed: w.seed,
+        time: w.time,
+        edits: w.edits,
+        name: 'Multiplayer',
+      });
+      game.mp = true;
+      for (const p of w.players) addRemotePlayer(p.pid, p.name, p);
+      toast(w.players.length
+        ? `Verbunden – ${w.players.length} Mitspieler online`
+        : 'Verbunden – du bist der erste Spieler');
+    },
+    onSet: m => applyRemoteSet(m.d, m.x, m.y, m.z, m.id),
+    onSnap: onSnapshot,
+    onJoin: m => {
+      addRemotePlayer(m.pid, m.name, null);
+      toast(`${m.name} ist beigetreten`);
+    },
+    onLeave: m => {
+      const rp = remotePlayers.get(m.pid);
+      if (rp) {
+        toast(`${rp.name} hat das Spiel verlassen`);
+        rp.dispose();
+        remotePlayers.delete(m.pid);
+      }
+    },
+    onTime: v => { if (game && game.mp) game.time = v; },
+    onClose: () => {
+      if (game && game.mp) quitToMenu();
+      toast('Verbindung zum Server verloren');
+    },
+    onError: msg => { status.textContent = msg; },
+  });
 }
 
 function openInventory(mode) {
@@ -1826,6 +1952,22 @@ el('btn-save').addEventListener('click', e => {
   }
 });
 el('btn-quit').addEventListener('click', quitToMenu);
+
+// Multiplayer-Menü
+el('btn-open-mp').addEventListener('click', () => {
+  el('mp-name').value = localStorage.getItem('cc-mp-name') || '';
+  el('mp-status').textContent = '';
+  menus.show('menu-mp');
+});
+el('btn-mp-back').addEventListener('click', () => {
+  netCleanup();
+  menus.show('menu-main');
+});
+el('btn-mp-join').addEventListener('click', () => {
+  const name = el('mp-name').value.trim() || 'Steve';
+  localStorage.setItem('cc-mp-name', name);
+  startMultiplayer(name);
+});
 el('btn-dead-quit').addEventListener('click', quitToMenu);
 el('btn-respawn').addEventListener('click', () => {
   if (game.dimName !== 'over') switchDim('over');
@@ -1898,9 +2040,15 @@ function tick(dt, now) {
 
   const p = game.player;
 
-  if (game.dimName === 'over') game.time = (game.time + dt / DAY_LENGTH) % 1;
+  // Multiplayer: Zeit läuft serverseitig immer weiter (auch in Nether/End)
+  if (game.dimName === 'over' || game.mp) game.time = (game.time + dt / DAY_LENGTH) % 1;
 
   p.update(dt);
+
+  if (game.mp) {
+    net.tick(dt, game.dimName, p.pos.x, p.pos.y, p.pos.z, p.yaw, p.pitch);
+    for (const rp of remotePlayers.values()) rp.update(dt);
+  }
   camera.position.set(p.pos.x, p.pos.y + EYE_HEIGHT, p.pos.z);
   camera.rotation.x = p.pitch;
   camera.rotation.y = p.yaw;
@@ -2034,5 +2182,8 @@ window.GAME = {
   effectiveLight,
   setTime(t) { game.time = t; },
   teleport(x, y, z) { game.player.pos = { x, y, z }; game.player.vel = { x: 0, y: 0, z: 0 }; },
+  net,
+  remotePlayers,
+  joinMultiplayer(name = 'Steve') { startMultiplayer(name); },
   I, B,
 };
