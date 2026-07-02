@@ -124,3 +124,51 @@ async fn join_set_snapshot_and_late_join() {
     let pleave = recv_type(&mut b, "pleave").await;
     assert_eq!(pleave["pid"].as_u64().unwrap(), pid_a);
 }
+
+#[tokio::test]
+async fn accounts_state_and_chat() {
+    let port = 39252;
+    let server = Command::new(env!("CARGO_BIN_EXE_claudemc-ws"))
+        .env("PORT", port.to_string())
+        .env("WORLD_SEED", "7")
+        .spawn()
+        .unwrap();
+    let _guard = ServerGuard(server);
+
+    // Erster Join legt den Account an; frischer Account hat keinen State
+    let mut a = connect(port).await;
+    send(&mut a, json!({"t":"join","name":"Fionn","pass":"geheim"})).await;
+    let w = recv_type(&mut a, "welcome").await;
+    assert!(w["state"].is_null());
+
+    // Chat wird an alle (inkl. Absender) verteilt
+    send(&mut a, json!({"t":"chat","msg":"Hallo Welt"})).await;
+    let chat = recv_type(&mut a, "chat").await;
+    assert_eq!(chat["name"], "Fionn");
+    assert_eq!(chat["msg"], "Hallo Welt");
+
+    // Doppel-Login mit gleichem Namen wird abgelehnt
+    let mut dup = connect(port).await;
+    send(&mut dup, json!({"t":"join","name":"FIONN","pass":"geheim"})).await;
+    let deny = recv_type(&mut dup, "deny").await;
+    assert!(deny["msg"].as_str().unwrap().contains("gerade"));
+
+    // Zustand speichern und trennen
+    send(&mut a, json!({"t":"state","data":{"hp":17,"inv":[[3,64]]}})).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    a.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Falsches Passwort → Deny
+    let mut wrong = connect(port).await;
+    send(&mut wrong, json!({"t":"join","name":"fionn","pass":"falsch"})).await;
+    let deny = recv_type(&mut wrong, "deny").await;
+    assert!(deny["msg"].as_str().unwrap().contains("Passwort"));
+
+    // Richtiges Passwort → State kommt zurück (Name case-insensitiv)
+    let mut back = connect(port).await;
+    send(&mut back, json!({"t":"join","name":"fionn","pass":"geheim"})).await;
+    let w2 = recv_type(&mut back, "welcome").await;
+    assert_eq!(w2["state"]["hp"], 17);
+    assert_eq!(w2["state"]["inv"][0][1], 64);
+}

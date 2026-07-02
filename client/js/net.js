@@ -20,8 +20,8 @@ export class Net {
     this.latency = null;
   }
 
-  // handlers: { onWelcome, onSet, onSnap, onJoin, onLeave, onTime, onClose, onError }
-  connect(url, name, handlers) {
+  // handlers: { onWelcome, onSet, onSnap, onJoin, onLeave, onChat, onTime, onClose, onError }
+  connect(url, name, pass, handlers) {
     this.handlers = handlers;
     let settled = false;
     try {
@@ -31,7 +31,7 @@ export class Net {
       return;
     }
     this.ws.addEventListener('open', () => {
-      this.send({ t: 'join', name });
+      this.send({ t: 'join', name, pass });
     });
     this.ws.addEventListener('message', ev => {
       let msg;
@@ -60,6 +60,11 @@ export class Net {
       case 'snap': h.onSnap?.(msg.p); break;
       case 'pjoin': if (msg.pid !== this.pid) h.onJoin?.(msg); break;
       case 'pleave': h.onLeave?.(msg); break;
+      case 'chat': h.onChat?.(msg); break;
+      case 'deny':
+        markSettled();
+        h.onError?.(msg.msg);
+        break;
       case 'time': h.onTime?.(msg.v); break;
       case 'pong': this.latency = performance.now() - msg.ts; break;
     }
@@ -74,6 +79,16 @@ export class Net {
   sendSet(d, x, y, z, id) {
     if (!this.active) return;
     this.send({ t: 'set', d, x, y, z, id });
+  }
+
+  sendChat(msg) {
+    if (!this.active) return;
+    this.send({ t: 'chat', msg });
+  }
+
+  sendState(data) {
+    if (!this.active) return;
+    this.send({ t: 'state', data });
   }
 
   // Pro Frame aufrufen: drosselt Positions-Updates auf 10 Hz und pingt.

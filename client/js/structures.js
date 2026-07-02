@@ -92,7 +92,12 @@ export function villageInRegion(ctx, rx, rz) {
     const d = 5 + ((ctx.hash3(rx, rz, 140 + i) * 3) | 0);
     const doorSide = (ctx.hash3(rx, rz, 150 + i) * 4) | 0;
     const wall = ctx.hash3(rx, rz, 160 + i);
-    const hy = ctx.terrainHeight(hx, hz);
+    // Höchste Ecke des Grundrisses: verhindert am Hang eingegrabene Häuser
+    const hy = Math.max(
+      ctx.terrainHeight(hx, hz),
+      ctx.terrainHeight(hx - 3, hz - 3), ctx.terrainHeight(hx + 3, hz - 3),
+      ctx.terrainHeight(hx - 3, hz + 3), ctx.terrainHeight(hx + 3, hz + 3),
+    );
     const house = {
       x: hx - (w >> 1), z: hz - (d >> 1), w, d, doorSide,
       y: hy,
@@ -122,8 +127,8 @@ export function rasterizeHouse(h, put) {
       const edgeX = x === h.x || x === h.x + h.w - 1;
       const edgeZ = z === h.z || z === h.z + h.d - 1;
       const corner = edgeX && edgeZ;
-      // Fundament + Boden
-      for (let y = y0 - 5; y < y0; y++) put(x, y, z, y === y0 - 1 ? B.PLANKS : B.COBBLE);
+      // Fundament + Boden (tief genug für Hanglagen)
+      for (let y = y0 - 8; y < y0; y++) put(x, y, z, y === y0 - 1 ? B.PLANKS : B.COBBLE);
       for (let dy = 0; dy < wallH; dy++) {
         const y = y0 + dy;
         if (corner) put(x, y, z, B.LOG);

@@ -27,9 +27,15 @@ const TIME_SYNC_EVERY: u32 = 100; // alle 100 Snap-Ticks (~10 s) Zeit synchronis
 #[derive(Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 enum ClientMsg {
-    Join { name: String },
+    Join {
+        name: String,
+        #[serde(default)]
+        pass: String,
+    },
     Pos { d: String, x: f64, y: f64, z: f64, yw: f64, pt: f64 },
     Set { d: String, x: i32, y: i32, z: i32, id: u16 },
+    Chat { msg: String },
+    State { data: serde_json::Value },
     Ping { ts: f64 },
 }
 
@@ -55,11 +61,15 @@ enum ServerMsg<'a> {
         players: Vec<PlayerInfo>,
         // dim -> chunkKey -> [[idx, blockId], ...]
         edits: HashMap<String, HashMap<String, Vec<(u32, u16)>>>,
+        // Zuletzt gespeicherter Spielerzustand dieses Accounts (Inventar, Position …)
+        state: Option<serde_json::Value>,
     },
     PJoin { pid: u32, name: &'a str },
     PLeave { pid: u32 },
     Snap { p: Vec<(u32, &'a str, f64, f64, f64, f64, f64)> },
     Set { d: &'a str, x: i32, y: i32, z: i32, id: u16, by: u32 },
+    Chat { pid: u32, name: &'a str, msg: &'a str },
+    Deny { msg: &'a str },
     Time { v: f64 },
     Pong { ts: f64 },
 }
@@ -68,7 +78,15 @@ enum ServerMsg<'a> {
 
 struct Player {
     info: PlayerInfo,
+    account: String, // Schlüssel in Hub.accounts (Name in Kleinbuchstaben)
     tx: mpsc::UnboundedSender<Message>,
+}
+
+// Account: Name (case-insensitiv) + frei gewähltes Passwort beim ersten Join.
+// Der Zustand (Inventar, Position, HP …) ist ein vom Client definiertes JSON-Blob.
+struct Account {
+    pass: String,
+    state: Option<serde_json::Value>,
 }
 
 struct Hub {
@@ -76,6 +94,7 @@ struct Hub {
     time: f64,
     next_pid: u32,
     players: HashMap<u32, Player>,
+    accounts: HashMap<String, Account>,
     // dim -> chunkKey -> localIndex -> blockId
     edits: HashMap<String, HashMap<String, HashMap<u32, u16>>>,
 }
@@ -87,6 +106,7 @@ impl Hub {
             time: 0.05, // Morgen, wie ein frischer Singleplayer-Start
             next_pid: 0,
             players: HashMap::new(),
+            accounts: HashMap::new(),
             edits: HashMap::new(),
         }
     }
@@ -241,12 +261,37 @@ async fn handle_connection(stream: TcpStream, hub: SharedHub) {
         };
 
         match parsed {
-            ClientMsg::Join { name } => {
+            ClientMsg::Join { name, pass } => {
                 if my_pid.is_some() {
                     continue; // doppeltes Join ignorieren
                 }
                 let name: String = name.chars().take(16).collect();
+                let account = name.to_lowercase();
                 let mut h = hub.lock().await;
+
+                // Auth: Account entsteht beim ersten Join; danach schützt das Passwort den Namen.
+                let deny = if h.players.values().any(|p| p.account == account) {
+                    Some("Dieser Name spielt gerade schon.")
+                } else {
+                    match h.accounts.get(&account) {
+                        Some(acc) if acc.pass != pass => {
+                            Some("Falsches Passwort für diesen Namen.")
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(msg) = deny {
+                    if let Ok(t) = serde_json::to_string(&ServerMsg::Deny { msg }) {
+                        let _ = tx.send(Message::Text(t));
+                    }
+                    break;
+                }
+                let acc = h
+                    .accounts
+                    .entry(account.clone())
+                    .or_insert(Account { pass, state: None });
+                let state = acc.state.clone();
+
                 let pid = h.next_pid;
                 h.next_pid += 1;
                 my_pid = Some(pid);
@@ -259,6 +304,7 @@ async fn handle_connection(stream: TcpStream, hub: SharedHub) {
                     time: h.time,
                     players: others,
                     edits: h.edits_snapshot(),
+                    state,
                 };
                 if let Ok(t) = serde_json::to_string(&welcome) {
                     let _ = tx.send(Message::Text(t));
@@ -276,7 +322,7 @@ async fn handle_connection(stream: TcpStream, hub: SharedHub) {
                     pt: 0.0,
                 };
                 println!("[+] Spieler {} ({}) verbunden", info.name, pid);
-                h.players.insert(pid, Player { info, tx: tx.clone() });
+                h.players.insert(pid, Player { info, account, tx: tx.clone() });
             }
             ClientMsg::Pos { d, x, y, z, yw, pt } => {
                 let Some(pid) = my_pid else { continue };
@@ -300,6 +346,27 @@ async fn handle_connection(stream: TcpStream, hub: SharedHub) {
                     h.broadcast(&ServerMsg::Set { d: &d, x, y, z, id, by: pid }, Some(pid));
                 }
             }
+            ClientMsg::Chat { msg } => {
+                let Some(pid) = my_pid else { continue };
+                let msg: String = msg.chars().take(200).collect();
+                if msg.trim().is_empty() {
+                    continue;
+                }
+                let h = hub.lock().await;
+                if let Some(p) = h.players.get(&pid) {
+                    // An alle inkl. Absender (einheitliche Darstellung im Chat-Log)
+                    h.broadcast(&ServerMsg::Chat { pid, name: &p.info.name, msg: &msg }, None);
+                }
+            }
+            ClientMsg::State { data } => {
+                let Some(pid) = my_pid else { continue };
+                let mut h = hub.lock().await;
+                let Some(p) = h.players.get(&pid) else { continue };
+                let account = p.account.clone();
+                if let Some(acc) = h.accounts.get_mut(&account) {
+                    acc.state = Some(data);
+                }
+            }
             ClientMsg::Ping { ts } => {
                 if let Ok(t) = serde_json::to_string(&ServerMsg::Pong { ts }) {
                     let _ = tx.send(Message::Text(t));
@@ -316,5 +383,8 @@ async fn handle_connection(stream: TcpStream, hub: SharedHub) {
         }
         h.broadcast(&ServerMsg::PLeave { pid }, None);
     }
-    writer.abort();
+    // Writer-Task sauber auslaufen lassen: erst wenn alle Sender weg sind,
+    // endet rx.recv() – so werden gepufferte Nachrichten (z. B. Deny) noch gesendet.
+    drop(tx);
+    let _ = writer.await;
 }

@@ -23,6 +23,9 @@
   <div id="debug"></div>
   <div id="toast" class="hidden"></div>
 
+  <div id="chat-log"></div>
+  <div id="chat-input-row" class="hidden">&gt;&nbsp;<span id="chat-input"></span><span id="chat-caret">_</span></div>
+
   <div id="bossbar" class="hidden">
     <div class="bb-name">Enderdrache</div>
     <div class="bb-track"><div id="bossbar-fill"></div></div>
@@ -56,6 +59,8 @@
       <h2>Multiplayer</h2>
       <p class="sub">Gemeinsame Überlebenswelt auf dem ClaudeMC-Server</p>
       <div class="form-row"><label>Spielername</label><input id="mp-name" type="text" placeholder="Steve" maxlength="16"></div>
+      <div class="form-row"><label>Passwort (beim ersten Beitritt frei wählen)</label><input id="mp-pass" type="password" placeholder="Passwort" maxlength="32"></div>
+      <p class="sub">Dein Inventar &amp; Fortschritt werden unter diesem Namen gespeichert.</p>
       <p class="sub" id="mp-status"></p>
       <button class="mbtn" id="btn-mp-join">Beitreten</button>
       <button class="mbtn secondary" id="btn-mp-back">Zurück</button>
