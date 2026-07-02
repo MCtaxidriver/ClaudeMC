@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <title>ClaudeCraft – Survival</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="style.css">
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "./vendor/three.module.js"
+      }
+    }
+  </script>
+</head>
+<body>
+  <canvas id="game"></canvas>
+
+  <div id="crosshair"></div>
+  <div id="eatbar-wrap" class="hidden"><div id="eatbar"></div></div>
+  <div id="water-overlay"></div>
+  <div id="damage-overlay"></div>
+  <div id="debug"></div>
+  <div id="toast" class="hidden"></div>
+
+  <div id="bossbar" class="hidden">
+    <div class="bb-name">Enderdrache</div>
+    <div class="bb-track"><div id="bossbar-fill"></div></div>
+  </div>
+
+  <div id="hud">
+    <div id="status-rows">
+      <div id="armor" class="status-row hidden"></div>
+      <div id="bars-row">
+        <div id="hearts" class="status-row"></div>
+        <div id="hunger" class="status-row"></div>
+      </div>
+      <div id="air" class="status-row hidden"></div>
+    </div>
+    <div id="hotbar"></div>
+  </div>
+
+  <div id="inv-screen" class="hidden"></div>
+  <div id="cursor-item" class="hidden"></div>
+
+  <div id="overlay">
+    <div id="menu-main" class="menu">
+      <h1>ClaudeCraft</h1>
+      <p class="sub">Survival · Biome · Nether · End · Enderdrache</p>
+      <div id="slots"></div>
+      <button class="mbtn" id="btn-open-mp">Multiplayer</button>
+      <button class="mbtn secondary" id="btn-open-settings">Einstellungen</button>
+    </div>
+
+    <div id="menu-mp" class="menu hidden">
+      <h2>Multiplayer</h2>
+      <p class="sub">Gemeinsame Überlebenswelt auf dem ClaudeMC-Server</p>
+      <div class="form-row"><label>Spielername</label><input id="mp-name" type="text" placeholder="Steve" maxlength="16"></div>
+      <p class="sub" id="mp-status"></p>
+      <button class="mbtn" id="btn-mp-join">Beitreten</button>
+      <button class="mbtn secondary" id="btn-mp-back">Zurück</button>
+    </div>
+
+    <div id="menu-new" class="menu hidden">
+      <h2>Neue Welt – Slot <span id="new-slot-nr"></span></h2>
+      <div class="form-row"><label>Weltname</label><input id="world-name" type="text" placeholder="Meine Welt" maxlength="24"></div>
+      <div class="form-row"><label>Seed (leer = zufällig)</label><input id="world-seed" type="text" placeholder="z. B. 1337 oder Text"></div>
+      <div class="form-row check-row"><label><input id="mode-creative-toggle" type="checkbox"> Kreativmodus</label></div>
+      <button class="mbtn" id="btn-create-world">Welt erschaffen</button>
+      <button class="mbtn secondary" id="btn-new-back">Zurück</button>
+    </div>
+
+    <div id="menu-settings" class="menu hidden">
+      <h2>Einstellungen</h2>
+      <div id="settings-body"></div>
+      <button class="mbtn" id="btn-settings-back">Fertig</button>
+    </div>
+
+    <div id="menu-confirm" class="menu hidden">
+      <h2>Bist du sicher?</h2>
+      <p class="sub" id="confirm-text"></p>
+      <button class="mbtn danger-big" id="btn-confirm-yes">Ja, löschen</button>
+      <button class="mbtn secondary" id="btn-confirm-no">Abbrechen</button>
+    </div>
+
+    <div id="menu-pause" class="menu hidden">
+      <h2>Pause</h2>
+      <button class="mbtn" id="btn-resume">Weiterspielen</button>
+      <button class="mbtn" id="btn-save">Speichern</button>
+      <button class="mbtn secondary" id="btn-pause-settings">Einstellungen</button>
+      <button class="mbtn secondary" id="btn-quit">Speichern &amp; Hauptmenü</button>
+      <div id="controls-help">
+        <p>WASD Bewegen · Maus Umsehen · Leertaste Springen/Schwimmen · Strg Sprinten · Shift Schleichen</p>
+        <p>Linksklick (halten) Abbauen · Rechtsklick Platzieren / Benutzen · Essen &amp; Bogen: Rechtsklick halten</p>
+        <p>E Inventar · Q Wegwerfen · F3 Debug · Kreativ: 2× Leertaste = Fliegen</p>
+      </div>
+    </div>
+
+    <div id="menu-dead" class="menu hidden">
+      <h2 class="death-title">Du bist gestorben!</h2>
+      <p class="sub" id="death-info"></p>
+      <button class="mbtn" id="btn-respawn">Wiederbeleben</button>
+      <button class="mbtn secondary" id="btn-dead-quit">Hauptmenü</button>
+    </div>
+  </div>
+
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
