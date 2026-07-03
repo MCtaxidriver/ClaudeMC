@@ -488,3 +488,47 @@ body.hurt #damage-overlay { opacity: 1; transition: opacity 0.05s; }
   z-index: 15;
   text-shadow: 1px 1px 0 #000;
 }
+
+/* Multiplayer-Chat */
+#chat-log {
+  position: fixed;
+  left: 10px;
+  bottom: 110px;
+  width: min(46vw, 520px);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  pointer-events: none;
+  z-index: 14;
+  font-size: 14px;
+}
+#chat-log .chat-line {
+  background: rgba(0, 0, 0, 0.45);
+  color: #fff;
+  padding: 2px 8px;
+  border-radius: 3px;
+  text-shadow: 1px 1px 0 #000;
+  word-break: break-word;
+  animation: chatIn 0.12s ease-out;
+}
+#chat-log .chat-line.system { color: #ffd75e; font-style: italic; }
+#chat-log .chat-line.fading { opacity: 0; transition: opacity 1s; }
+#chat-log .chat-line .chat-name { color: #8fd3ff; font-weight: bold; }
+@keyframes chatIn { from { transform: translateX(-8px); opacity: 0; } }
+#chat-input-row {
+  position: fixed;
+  left: 10px;
+  bottom: 84px;
+  width: min(46vw, 520px);
+  background: rgba(0, 0, 0, 0.65);
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  border-radius: 3px;
+  color: #fff;
+  font-size: 14px;
+  padding: 4px 8px;
+  z-index: 15;
+  text-shadow: 1px 1px 0 #000;
+  word-break: break-word;
+}
+#chat-caret { animation: caretBlink 1s steps(1) infinite; }
+@keyframes caretBlink { 50% { opacity: 0; } }

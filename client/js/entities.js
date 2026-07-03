@@ -7,7 +7,7 @@ import * as THREE from 'three';
 import { B, BLOCK_INFO, isWater } from './blocks.js';
 import { GRAVITY, WORLD_HEIGHT } from './config.js';
 import { I, itemIcon, dropsForBlock } from './items.js';
-import { getEntitySkin, isPackActive } from './texpack.js';
+import { getEntitySkin } from './texpack.js';
 
 const EPS = 1e-3;
 
@@ -85,23 +85,7 @@ export class Entity {
   }
 }
 
-// ============ Texturen: Missing-Fallback + Skin-Mapping ============
-let missingTex = null;
-function missingTexture() {
-  if (missingTex) return missingTex;
-  const c = document.createElement('canvas');
-  c.width = c.height = 16;
-  const g = c.getContext('2d');
-  for (let y = 0; y < 2; y++) for (let x = 0; x < 2; x++) {
-    g.fillStyle = (x + y) % 2 === 0 ? '#f800f8' : '#000';
-    g.fillRect(x * 8, y * 8, 8, 8);
-  }
-  missingTex = new THREE.CanvasTexture(c);
-  missingTex.magFilter = THREE.NearestFilter;
-  missingTex.minFilter = THREE.NearestFilter;
-  missingTex.colorSpace = THREE.SRGBColorSpace;
-  return missingTex;
-}
+// ============ Texturen: Skin-Mapping ============
 
 const skinTexCache = new Map();
 function skinTexture(type) {
@@ -114,9 +98,9 @@ function skinTexture(type) {
     tex.minFilter = THREE.NearestFilter;
     tex.colorSpace = THREE.SRGBColorSpace;
     entry = { tex, w: skin.canvas.width, h: skin.canvas.height };
-  } else if (isPackActive()) {
-    entry = { tex: missingTexture(), w: 16, h: 16, missing: true };
   }
+  // Fehlt der Skin im Pack (z. B. Blaze in modernen Packs), bleibt entry null
+  // und buildModel nutzt das prozedurale Farbmodell statt des Magenta-Platzhalters.
   skinTexCache.set(type, entry);
   return entry;
 }

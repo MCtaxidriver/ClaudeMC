@@ -24,21 +24,32 @@ Clients generieren es deterministisch aus dem Seed.
 
 | Nachricht | Bedeutung |
 |---|---|
-| `{"t":"join","name":"…"}` | Beitritt; Antwort ist `welcome` |
+| `{"t":"join","name":"…","pass":"…"}` | Beitritt; erster Join legt den Account an, danach schützt das Passwort den Namen (case-insensitiv). Antwort: `welcome` oder `deny` |
 | `{"t":"pos","d":"over","x":…,"y":…,"z":…,"yw":…,"pt":…}` | Position/Blick, max. 10 Hz |
 | `{"t":"set","d":…,"x":…,"y":…,"z":…,"id":…}` | Blockänderung |
+| `{"t":"chat","msg":"…"}` | Chat-Nachricht (max. 200 Zeichen) |
+| `{"t":"state","data":{…}}` | Spielerzustand (Inventar, Position, HP …) für den Account speichern; der Client sendet alle 10 s sowie beim Verlassen |
+| `{"t":"hit","target":…,"dmg":…,"kx":…,"kz":…,"r":…}` | PvP-Treffer melden; Server prüft Dimension + Reichweite (Nahkampf 8, Pfeil `r` 80 Blöcke), deckelt `dmg` auf 12 und relayt nur ans Ziel |
+| `{"t":"died","by":…}` | Vom Opfer gemeldeter Tod → Server broadcastet die Todesmeldung |
 | `{"t":"ping","ts":…}` | Keepalive/Latenz |
 
 **Server → Client**
 
 | Nachricht | Bedeutung |
 |---|---|
-| `welcome` | `pid`, `seed`, `time`, Spielerliste, komplettes Edit-Journal |
+| `welcome` | `pid`, `seed`, `time`, Spielerliste, komplettes Edit-Journal, gespeicherter Account-`state` (oder `null`) |
+| `deny` | Beitritt abgelehnt (falsches Passwort / Name gerade online) |
 | `snap` | Positions-Snapshot aller Spieler, 10 Hz |
 | `set` | Blockänderung eines Mitspielers (`by` = pid) |
+| `chat` | Chat-Broadcast (`pid`, `name`, `msg`) an alle inkl. Absender |
+| `hit` | Eingehender PvP-Treffer (`from`, `dmg`, `kx`, `kz`); das Ziel wendet den Schaden inkl. eigener Rüstungsberechnung an |
+| `sys` | System-Chatzeile (z. B. „⚔ A wurde von B besiegt") |
 | `pjoin` / `pleave` | Spieler kommt/geht |
 | `time` | Weltzeit-Sync (~alle 10 s) |
 | `pong` | Antwort auf `ping` |
+
+Im Spiel öffnet **T** den Chat (Enter sendet, Esc schliesst). Accounts und
+Zustand liegen wie das Journal im RAM des Servers.
 
 Der Welt-Seed kann per Env-Var `WORLD_SEED` fixiert werden (Zahl oder Text);
 ohne sie würfelt der Server beim Start. Das Journal lebt im RAM — ein

@@ -27,9 +27,26 @@ const TIME_SYNC_EVERY: u32 = 100; // alle 100 Snap-Ticks (~10 s) Zeit synchronis
 #[derive(Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
 enum ClientMsg {
-    Join { name: String },
+    Join {
+        name: String,
+        #[serde(default)]
+        pass: String,
+    },
     Pos { d: String, x: f64, y: f64, z: f64, yw: f64, pt: f64 },
     Set { d: String, x: i32, y: i32, z: i32, id: u16 },
+    Chat { msg: String },
+    State { data: serde_json::Value },
+    // PvP: Angreifer meldet Treffer; r = Fernkampf (Pfeil, grössere Reichweite)
+    Hit {
+        target: u32,
+        dmg: f64,
+        kx: f64,
+        kz: f64,
+        #[serde(default)]
+        r: bool,
+    },
+    // Vom Opfer gemeldet: Tod (by = Angreifer-pid oder eigene pid bei Umgebungstod)
+    Died { by: u32 },
     Ping { ts: f64 },
 }
 
@@ -55,11 +72,17 @@ enum ServerMsg<'a> {
         players: Vec<PlayerInfo>,
         // dim -> chunkKey -> [[idx, blockId], ...]
         edits: HashMap<String, HashMap<String, Vec<(u32, u16)>>>,
+        // Zuletzt gespeicherter Spielerzustand dieses Accounts (Inventar, Position …)
+        state: Option<serde_json::Value>,
     },
     PJoin { pid: u32, name: &'a str },
     PLeave { pid: u32 },
     Snap { p: Vec<(u32, &'a str, f64, f64, f64, f64, f64)> },
     Set { d: &'a str, x: i32, y: i32, z: i32, id: u16, by: u32 },
+    Chat { pid: u32, name: &'a str, msg: &'a str },
+    Hit { from: u32, dmg: f64, kx: f64, kz: f64 },
+    Sys { msg: &'a str },
+    Deny { msg: &'a str },
     Time { v: f64 },
     Pong { ts: f64 },
 }
@@ -68,7 +91,15 @@ enum ServerMsg<'a> {
 
 struct Player {
     info: PlayerInfo,
+    account: String, // Schlüssel in Hub.accounts (Name in Kleinbuchstaben)
     tx: mpsc::UnboundedSender<Message>,
+}
+
+// Account: Name (case-insensitiv) + frei gewähltes Passwort beim ersten Join.
+// Der Zustand (Inventar, Position, HP …) ist ein vom Client definiertes JSON-Blob.
+struct Account {
+    pass: String,
+    state: Option<serde_json::Value>,
 }
 
 struct Hub {
@@ -76,6 +107,7 @@ struct Hub {
     time: f64,
     next_pid: u32,
     players: HashMap<u32, Player>,
+    accounts: HashMap<String, Account>,
     // dim -> chunkKey -> localIndex -> blockId
     edits: HashMap<String, HashMap<String, HashMap<u32, u16>>>,
 }
@@ -87,6 +119,7 @@ impl Hub {
             time: 0.05, // Morgen, wie ein frischer Singleplayer-Start
             next_pid: 0,
             players: HashMap::new(),
+            accounts: HashMap::new(),
             edits: HashMap::new(),
         }
     }
@@ -241,12 +274,37 @@ async fn handle_connection(stream: TcpStream, hub: SharedHub) {
         };
 
         match parsed {
-            ClientMsg::Join { name } => {
+            ClientMsg::Join { name, pass } => {
                 if my_pid.is_some() {
                     continue; // doppeltes Join ignorieren
                 }
                 let name: String = name.chars().take(16).collect();
+                let account = name.to_lowercase();
                 let mut h = hub.lock().await;
+
+                // Auth: Account entsteht beim ersten Join; danach schützt das Passwort den Namen.
+                let deny = if h.players.values().any(|p| p.account == account) {
+                    Some("Dieser Name spielt gerade schon.")
+                } else {
+                    match h.accounts.get(&account) {
+                        Some(acc) if acc.pass != pass => {
+                            Some("Falsches Passwort für diesen Namen.")
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(msg) = deny {
+                    if let Ok(t) = serde_json::to_string(&ServerMsg::Deny { msg }) {
+                        let _ = tx.send(Message::Text(t));
+                    }
+                    break;
+                }
+                let acc = h
+                    .accounts
+                    .entry(account.clone())
+                    .or_insert(Account { pass, state: None });
+                let state = acc.state.clone();
+
                 let pid = h.next_pid;
                 h.next_pid += 1;
                 my_pid = Some(pid);
@@ -259,6 +317,7 @@ async fn handle_connection(stream: TcpStream, hub: SharedHub) {
                     time: h.time,
                     players: others,
                     edits: h.edits_snapshot(),
+                    state,
                 };
                 if let Ok(t) = serde_json::to_string(&welcome) {
                     let _ = tx.send(Message::Text(t));
@@ -276,7 +335,7 @@ async fn handle_connection(stream: TcpStream, hub: SharedHub) {
                     pt: 0.0,
                 };
                 println!("[+] Spieler {} ({}) verbunden", info.name, pid);
-                h.players.insert(pid, Player { info, tx: tx.clone() });
+                h.players.insert(pid, Player { info, account, tx: tx.clone() });
             }
             ClientMsg::Pos { d, x, y, z, yw, pt } => {
                 let Some(pid) = my_pid else { continue };
@@ -300,6 +359,67 @@ async fn handle_connection(stream: TcpStream, hub: SharedHub) {
                     h.broadcast(&ServerMsg::Set { d: &d, x, y, z, id, by: pid }, Some(pid));
                 }
             }
+            ClientMsg::Chat { msg } => {
+                let Some(pid) = my_pid else { continue };
+                let msg: String = msg.chars().take(200).collect();
+                if msg.trim().is_empty() {
+                    continue;
+                }
+                let h = hub.lock().await;
+                if let Some(p) = h.players.get(&pid) {
+                    // An alle inkl. Absender (einheitliche Darstellung im Chat-Log)
+                    h.broadcast(&ServerMsg::Chat { pid, name: &p.info.name, msg: &msg }, None);
+                }
+            }
+            ClientMsg::State { data } => {
+                let Some(pid) = my_pid else { continue };
+                let mut h = hub.lock().await;
+                let Some(p) = h.players.get(&pid) else { continue };
+                let account = p.account.clone();
+                if let Some(acc) = h.accounts.get_mut(&account) {
+                    acc.state = Some(data);
+                }
+            }
+            ClientMsg::Hit { target, dmg, kx, kz, r } => {
+                let Some(pid) = my_pid else { continue };
+                if pid == target || !dmg.is_finite() || dmg <= 0.0 {
+                    continue;
+                }
+                let dmg = dmg.min(12.0);
+                let kx = if kx.is_finite() { kx.clamp(-12.0, 12.0) } else { 0.0 };
+                let kz = if kz.is_finite() { kz.clamp(-12.0, 12.0) } else { 0.0 };
+                let h = hub.lock().await;
+                let (Some(att), Some(tgt)) = (h.players.get(&pid), h.players.get(&target))
+                else {
+                    continue;
+                };
+                // Plausibilität: gleiche Dimension, Reichweite (Nahkampf 8, Pfeil 80)
+                if att.info.d != tgt.info.d {
+                    continue;
+                }
+                let dist = ((att.info.x - tgt.info.x).powi(2)
+                    + (att.info.y - tgt.info.y).powi(2)
+                    + (att.info.z - tgt.info.z).powi(2))
+                .sqrt();
+                if dist > if r { 80.0 } else { 8.0 } {
+                    continue;
+                }
+                if let Ok(t) = serde_json::to_string(&ServerMsg::Hit { from: pid, dmg, kx, kz }) {
+                    let _ = tgt.tx.send(Message::Text(t));
+                }
+            }
+            ClientMsg::Died { by } => {
+                let Some(pid) = my_pid else { continue };
+                let h = hub.lock().await;
+                let Some(victim) = h.players.get(&pid) else { continue };
+                let msg = match h.players.get(&by) {
+                    Some(killer) if by != pid => {
+                        format!("⚔ {} wurde von {} besiegt", victim.info.name, killer.info.name)
+                    }
+                    _ => format!("☠ {} ist gestorben", victim.info.name),
+                };
+                h.broadcast(&ServerMsg::Sys { msg: &msg }, None);
+            }
             ClientMsg::Ping { ts } => {
                 if let Ok(t) = serde_json::to_string(&ServerMsg::Pong { ts }) {
                     let _ = tx.send(Message::Text(t));
@@ -316,5 +436,8 @@ async fn handle_connection(stream: TcpStream, hub: SharedHub) {
         }
         h.broadcast(&ServerMsg::PLeave { pid }, None);
     }
-    writer.abort();
+    // Writer-Task sauber auslaufen lassen: erst wenn alle Sender weg sind,
+    // endet rx.recv() – so werden gepufferte Nachrichten (z. B. Deny) noch gesendet.
+    drop(tx);
+    let _ = writer.await;
 }

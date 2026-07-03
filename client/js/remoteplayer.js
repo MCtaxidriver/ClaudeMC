@@ -45,6 +45,8 @@ export class RemotePlayer {
     const shirt = new THREE.MeshLambertMaterial({ color: new THREE.Color().setHSL(hue, 0.55, 0.5) });
     const pants = new THREE.MeshLambertMaterial({ color: new THREE.Color().setHSL(hue, 0.45, 0.32) });
     const skin = new THREE.MeshLambertMaterial({ color: 0xd8a988 });
+    this.mats = [shirt, pants, skin];
+    this.flashTimer = 0; // rotes Aufblitzen bei PvP-Treffer
 
     const box = (w, h, d, mat, x, y, z, parent) => {
       const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
@@ -82,7 +84,18 @@ export class RemotePlayer {
     return dimChanged;
   }
 
+  flash() {
+    this.flashTimer = 0.25;
+    for (const m of this.mats) m.emissive.setHex(0xaa2020);
+  }
+
   update(dt) {
+    if (this.flashTimer > 0) {
+      this.flashTimer -= dt;
+      if (this.flashTimer <= 0) {
+        for (const m of this.mats) m.emissive.setHex(0x000000);
+      }
+    }
     if (!this.cur) return;
     const t = Math.min(1, dt * 12); // glättet die 10-Hz-Snapshots
     const c = this.cur, g = this.target;
