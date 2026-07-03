@@ -1,0 +1,8 @@
+{
+  "open": false,
+  "seed": "meine-welt-2026",
+  "whitelist": {
+    "fionn": "geheimes-passwort",
+    "freund1": "anderes-passwort"
+  }
+}

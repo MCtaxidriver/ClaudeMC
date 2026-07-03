@@ -151,8 +151,29 @@ let ambientTimer = 12;
 const params = new URLSearchParams(location.search);
 
 // ============ Multiplayer-Netzwerk ============
-// Fest verdrahteter Live-Server; ?server=ws://localhost:8080 übersteuert für Tests.
-const SERVER_URL = params.get('server') || DEFAULT_SERVER;
+// Standard-Server: der offizielle Hub – ausser das Spiel wird gerade von einem
+// selbst gehosteten Server ausgeliefert, dann ist dieser Host der Standard.
+// ?server=… übersteuert alles (praktisch für Tests).
+function defaultServerUrl() {
+  if (params.get('server')) return params.get('server');
+  if ((location.protocol === 'http:' || location.protocol === 'https:') &&
+      location.host && !location.host.endsWith('github.io')) {
+    return (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
+  }
+  return DEFAULT_SERVER;
+}
+
+// Eingaben wie "192.168.1.5:8080" oder "meinserver.de" in eine WS-URL wandeln
+function normalizeServerUrl(input) {
+  const s = (input || '').trim();
+  if (!s) return defaultServerUrl();
+  if (/^wss?:\/\//i.test(s)) return s;
+  if (/^https?:\/\//i.test(s)) return s.replace(/^http/i, 'ws');
+  const host = s.split('/')[0].split(':')[0];
+  const isLocal = host === 'localhost' || /^[0-9.]+$/.test(host) || host.endsWith('.local');
+  return (isLocal ? 'ws://' : 'wss://') + s;
+}
+
 const net = new Net();
 const remotePlayers = new Map(); // pid -> RemotePlayer
 
@@ -1908,10 +1929,10 @@ function applyRemoteSet(d, x, y, z, id) {
   }
 }
 
-function startMultiplayer(name, pass) {
+function startMultiplayer(name, pass, url = defaultServerUrl()) {
   const status = el('mp-status');
   status.textContent = 'Verbinde mit Server…';
-  net.connect(SERVER_URL, name, pass, {
+  net.connect(url, name, pass, {
     onWelcome: w => {
       status.textContent = '';
       const st = w.state || {};
@@ -2148,6 +2169,8 @@ el('btn-quit').addEventListener('click', quitToMenu);
 el('btn-open-mp').addEventListener('click', () => {
   el('mp-name').value = localStorage.getItem('cc-mp-name') || '';
   el('mp-pass').value = localStorage.getItem('cc-mp-pass') || '';
+  el('mp-server').value = localStorage.getItem('cc-mp-server') || '';
+  el('mp-server').placeholder = defaultServerUrl();
   el('mp-status').textContent = '';
   menus.show('menu-mp');
 });
@@ -2158,9 +2181,11 @@ el('btn-mp-back').addEventListener('click', () => {
 el('btn-mp-join').addEventListener('click', () => {
   const name = el('mp-name').value.trim() || 'Steve';
   const pass = el('mp-pass').value;
+  const serverInput = el('mp-server').value;
   localStorage.setItem('cc-mp-name', name);
   localStorage.setItem('cc-mp-pass', pass);
-  startMultiplayer(name, pass);
+  localStorage.setItem('cc-mp-server', serverInput.trim());
+  startMultiplayer(name, pass, normalizeServerUrl(serverInput));
 });
 el('btn-dead-quit').addEventListener('click', quitToMenu);
 el('btn-respawn').addEventListener('click', () => {
@@ -2384,7 +2409,7 @@ window.GAME = {
   teleport(x, y, z) { game.player.pos = { x, y, z }; game.player.vel = { x: 0, y: 0, z: 0 }; },
   net,
   remotePlayers,
-  joinMultiplayer(name = 'Steve', pass = '') { startMultiplayer(name, pass); },
+  joinMultiplayer(name = 'Steve', pass = '', url) { startMultiplayer(name, pass, url ? normalizeServerUrl(url) : defaultServerUrl()); },
   sendChat(msg) { net.sendChat(msg); },
   I, B,
 };
