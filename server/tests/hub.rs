@@ -276,3 +276,44 @@ async fn whitelist_config_and_static_client() {
     let resp2 = String::from_utf8_lossy(&buf2);
     assert!(!resp2.contains("tokio"), "Traversal darf keine Serverdateien liefern");
 }
+
+// Render-Deployments: Whitelist komplett über Env-Variablen, ohne Config-Datei
+#[tokio::test]
+async fn whitelist_via_env_vars() {
+    let port = 39255;
+    let server = Command::new(env!("CARGO_BIN_EXE_claudemc-ws"))
+        .env("PORT", port.to_string())
+        .env("WHITELIST", "Fionn:geheim, anna:pw2")
+        .env("WORLD_SEED", "99")
+        .spawn()
+        .unwrap();
+    let _guard = ServerGuard(server);
+
+    // WHITELIST gesetzt -> Server implizit geschlossen
+    let mut x = connect(port).await;
+    send(&mut x, json!({"t":"join","name":"Gast","pass":"egal"})).await;
+    assert!(recv_type(&mut x, "deny").await["msg"].as_str().unwrap().contains("Whitelist"));
+
+    // Beide Env-Einträge funktionieren (Namen case-insensitiv, Leerzeichen getrimmt)
+    let mut a = connect(port).await;
+    send(&mut a, json!({"t":"join","name":"FIONN","pass":"geheim"})).await;
+    assert_eq!(recv_type(&mut a, "welcome").await["seed"], 99);
+    let mut b = connect(port).await;
+    send(&mut b, json!({"t":"join","name":"Anna","pass":"pw2"})).await;
+    let w = recv_type(&mut b, "welcome").await;
+    assert_eq!(w["players"].as_array().unwrap().len(), 1);
+
+    // SERVER_OPEN=true übersteuert die Whitelist -> wieder offen
+    drop(_guard);
+    let port2 = 39256;
+    let server2 = Command::new(env!("CARGO_BIN_EXE_claudemc-ws"))
+        .env("PORT", port2.to_string())
+        .env("WHITELIST", "Fionn:geheim")
+        .env("SERVER_OPEN", "true")
+        .spawn()
+        .unwrap();
+    let _guard2 = ServerGuard(server2);
+    let mut g = connect(port2).await;
+    send(&mut g, json!({"t":"join","name":"Gast","pass":"frei"})).await;
+    recv_type(&mut g, "welcome").await;
+}

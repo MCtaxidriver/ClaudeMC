@@ -75,16 +75,33 @@ fn load_config() -> (ServerConfig, Option<u32>) {
         ),
         _ => None,
     });
-    let whitelist = file
+    let mut whitelist: HashMap<String, String> = file
         .whitelist
         .unwrap_or_default()
         .into_iter()
         .map(|(k, v)| (k.to_lowercase(), v))
         .collect();
-    (
-        ServerConfig { open: file.open.unwrap_or(true), whitelist },
-        seed,
-    )
+    let mut open = file.open.unwrap_or(true);
+
+    // Env-Überschreibungen (für Render & Co., wo man keine Dateien pflegt):
+    //   WHITELIST="fionn:pass1,anna:pass2"  -> Einträge ergänzen, Server implizit zu
+    //   SERVER_OPEN=true|false              -> expliziter Modus (gewinnt immer)
+    if let Ok(v) = std::env::var("WHITELIST") {
+        for pair in v.split(',') {
+            if let Some((n, p)) = pair.split_once(':') {
+                let (n, p) = (n.trim().to_lowercase(), p.trim());
+                if !n.is_empty() && !p.is_empty() {
+                    whitelist.insert(n, p.to_string());
+                }
+            }
+        }
+        open = false;
+    }
+    if let Ok(v) = std::env::var("SERVER_OPEN") {
+        open = matches!(v.to_lowercase().as_str(), "true" | "1" | "yes" | "ja");
+    }
+
+    (ServerConfig { open, whitelist }, seed)
 }
 
 fn hash_seed(s: &str) -> u32 {
