@@ -10,22 +10,52 @@ permissions:
   contents: read
   pages: write
   id-token: write
+  actions: write # zum Aufräumen doppelter Artefakte bei Re-Runs
 
 concurrency:
   group: pages
   cancel-in-progress: true
 
 jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: client
+
   deploy:
+    needs: build
     runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+      # Re-Runs hinterlassen das Artefakt des vorherigen Versuchs im selben Run;
+      # deploy-pages bricht dann mit "Multiple artifacts named github-pages" ab.
+      # Deshalb: alle bis auf das neueste gleichnamige Artefakt löschen.
+      - name: Clean up duplicate artifacts from re-runs
+        uses: actions/github-script@v7
         with:
-          path: client
+          script: |
+            const { data } = await github.rest.actions.listWorkflowRunArtifacts({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: context.runId,
+              per_page: 100,
+            });
+            const pages = data.artifacts
+              .filter(a => a.name === 'github-pages')
+              .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+            for (const stale of pages.slice(1)) {
+              core.info(`Lösche veraltetes Artefakt ${stale.id} (${stale.created_at})`);
+              await github.rest.actions.deleteArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: stale.id,
+              });
+            }
       - id: deployment
         uses: actions/deploy-pages@v4
