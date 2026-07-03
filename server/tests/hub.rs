@@ -215,3 +215,105 @@ async fn pvp_hit_relay_and_death_message() {
     let msg = sys["msg"].as_str().unwrap();
     assert!(msg.contains("Def") && msg.contains("Att") && msg.contains("besiegt"), "{msg}");
 }
+
+#[tokio::test]
+async fn whitelist_config_and_static_client() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let port = 39254;
+    let cfg_path = std::env::temp_dir().join("claudemc-test-config.json");
+    std::fs::write(
+        &cfg_path,
+        r#"{ "open": false, "seed": 4711, "whitelist": { "Fionn": "geheim" } }"#,
+    )
+    .unwrap();
+
+    let server = Command::new(env!("CARGO_BIN_EXE_claudemc-ws"))
+        .env("PORT", port.to_string())
+        .env("CONFIG_PATH", &cfg_path)
+        .spawn()
+        .unwrap();
+    let _guard = ServerGuard(server);
+
+    // Nicht auf der Whitelist -> Deny
+    let mut x = connect(port).await;
+    send(&mut x, json!({"t":"join","name":"Fremder","pass":"egal"})).await;
+    let deny = recv_type(&mut x, "deny").await;
+    assert!(deny["msg"].as_str().unwrap().contains("Whitelist"));
+
+    // Whitelist-Name mit falschem Passwort -> Deny
+    let mut y = connect(port).await;
+    send(&mut y, json!({"t":"join","name":"fionn","pass":"falsch"})).await;
+    let deny = recv_type(&mut y, "deny").await;
+    assert!(deny["msg"].as_str().unwrap().contains("Passwort"));
+
+    // Whitelist-Name + korrektes Passwort -> Welcome mit Config-Seed
+    // (Whitelist-Schlüssel sind case-insensitiv: "Fionn" in der Config, "fionn" beim Join)
+    let mut ok = connect(port).await;
+    send(&mut ok, json!({"t":"join","name":"fionn","pass":"geheim"})).await;
+    let w = recv_type(&mut ok, "welcome").await;
+    assert_eq!(w["seed"], 4711);
+
+    // Statisches Ausliefern: GET / liefert die index.html des Spiels
+    let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    tcp.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf = Vec::new();
+    tcp.read_to_end(&mut buf).await.unwrap();
+    let resp = String::from_utf8_lossy(&buf);
+    assert!(resp.starts_with("HTTP/1.1 200"), "{}", &resp[..60.min(resp.len())]);
+    assert!(resp.contains("text/html"));
+    assert!(resp.contains("ClaudeCraft"), "index.html-Inhalt fehlt");
+
+    // Pfad-Traversal wird geblockt
+    let mut tcp2 = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    tcp2.write_all(b"GET /../server/Cargo.toml HTTP/1.1\r\nHost: l\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut buf2 = Vec::new();
+    tcp2.read_to_end(&mut buf2).await.unwrap();
+    let resp2 = String::from_utf8_lossy(&buf2);
+    assert!(!resp2.contains("tokio"), "Traversal darf keine Serverdateien liefern");
+}
+
+// Render-Deployments: Whitelist komplett über Env-Variablen, ohne Config-Datei
+#[tokio::test]
+async fn whitelist_via_env_vars() {
+    let port = 39255;
+    let server = Command::new(env!("CARGO_BIN_EXE_claudemc-ws"))
+        .env("PORT", port.to_string())
+        .env("WHITELIST", "Fionn:geheim, anna:pw2")
+        .env("WORLD_SEED", "99")
+        .spawn()
+        .unwrap();
+    let _guard = ServerGuard(server);
+
+    // WHITELIST gesetzt -> Server implizit geschlossen
+    let mut x = connect(port).await;
+    send(&mut x, json!({"t":"join","name":"Gast","pass":"egal"})).await;
+    assert!(recv_type(&mut x, "deny").await["msg"].as_str().unwrap().contains("Whitelist"));
+
+    // Beide Env-Einträge funktionieren (Namen case-insensitiv, Leerzeichen getrimmt)
+    let mut a = connect(port).await;
+    send(&mut a, json!({"t":"join","name":"FIONN","pass":"geheim"})).await;
+    assert_eq!(recv_type(&mut a, "welcome").await["seed"], 99);
+    let mut b = connect(port).await;
+    send(&mut b, json!({"t":"join","name":"Anna","pass":"pw2"})).await;
+    let w = recv_type(&mut b, "welcome").await;
+    assert_eq!(w["players"].as_array().unwrap().len(), 1);
+
+    // SERVER_OPEN=true übersteuert die Whitelist -> wieder offen
+    drop(_guard);
+    let port2 = 39256;
+    let server2 = Command::new(env!("CARGO_BIN_EXE_claudemc-ws"))
+        .env("PORT", port2.to_string())
+        .env("WHITELIST", "Fionn:geheim")
+        .env("SERVER_OPEN", "true")
+        .spawn()
+        .unwrap();
+    let _guard2 = ServerGuard(server2);
+    let mut g = connect(port2).await;
+    send(&mut g, json!({"t":"join","name":"Gast","pass":"frei"})).await;
+    recv_type(&mut g, "welcome").await;
+}

@@ -1,0 +1,21 @@
+# Render-Blueprint: eigener ClaudeMC-Server mit einem Klick.
+# Repo forken -> render.com -> New + -> Blueprint -> dieses Repo wählen.
+# Render fragt beim Einrichten nach den Env-Variablen (leer lassen = offener Server).
+services:
+  - type: web
+    name: claudemc-server
+    runtime: rust
+    rootDir: server
+    buildCommand: cargo build --release
+    startCommand: ./target/release/claudemc-ws
+    plan: free
+    envVars:
+      # "name:passwort,name2:passwort2" – gesetzt = nur diese Spieler dürfen rein
+      - key: WHITELIST
+        sync: false
+      # Zahl oder Text; leer = zufälliger Seed bei jedem Serverstart
+      - key: WORLD_SEED
+        sync: false
+      # "true" erzwingt einen offenen Server, auch wenn WHITELIST gesetzt ist
+      - key: SERVER_OPEN
+        sync: false

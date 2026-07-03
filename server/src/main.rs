@@ -1,26 +1,117 @@
-// ClaudeMC Multiplayer-Hub
+// ClaudeMC Multiplayer-Server
 //
-// Autoritativer WebSocket-Server: hält Seed, Weltzeit und das Block-Edit-Journal
-// (dasselbe Format wie World.serializeEdits() im Client) und verteilt
-// Spieler-Positionen als gebündelte Snapshots. Terrain wird nicht übertragen —
-// die Clients generieren es deterministisch aus dem Seed.
+// Ein Binary = ein kompletter Spielserver, wie bei Minecraft selbst hostbar:
+//  - HTTP: liefert das Spiel (den /client-Ordner) direkt aus -> Freunde öffnen
+//    einfach http://<deine-ip>:<port>/ im Browser
+//  - WebSocket (gleicher Port, Upgrade auf beliebigem Pfad): der Multiplayer-Hub
+//  - server-config.json: offener Server oder Whitelist mit Passwort pro Spieler
+//
+// Der Hub ist autoritativ für Seed, Weltzeit und das Block-Edit-Journal
+// (dasselbe Format wie World.serializeEdits() im Client); Terrain generieren
+// die Clients deterministisch aus dem Seed.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use axum::extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
+use axum::extract::State;
+use axum::http::{header, StatusCode, Uri};
+use axum::response::{IntoResponse, Response};
+use axum::Router;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
-use tokio_tungstenite::accept_async;
-use tokio_tungstenite::tungstenite::Message;
 
 const CHUNK_SIZE: i32 = 16;
 const WORLD_HEIGHT: i32 = 96;
 const DAY_LENGTH: f64 = 480.0; // Sekunden pro Tag/Nacht-Zyklus (wie client/js/config.js)
 const SNAP_INTERVAL_MS: u64 = 100; // 10 Hz Positions-Broadcast
 const TIME_SYNC_EVERY: u32 = 100; // alle 100 Snap-Ticks (~10 s) Zeit synchronisieren
+
+// ============ Server-Konfiguration ============
+
+// server-config.json (Pfad via CONFIG_PATH übersteuerbar):
+// {
+//   "open": false,                       // false = nur Whitelist-Spieler
+//   "seed": 1337,                        // Zahl oder Text; fehlt -> zufällig
+//   "whitelist": { "fionn": "geheim" }   // Name (case-insensitiv) -> Passwort
+// }
+#[derive(Deserialize, Default)]
+struct FileConfig {
+    open: Option<bool>,
+    seed: Option<serde_json::Value>,
+    whitelist: Option<HashMap<String, String>>,
+}
+
+struct ServerConfig {
+    open: bool,
+    whitelist: HashMap<String, String>, // Schlüssel kleingeschrieben
+}
+
+fn load_config() -> (ServerConfig, Option<u32>) {
+    let path = std::env::var("CONFIG_PATH").unwrap_or_else(|_| "server-config.json".into());
+    let file: FileConfig = match std::fs::read_to_string(&path) {
+        Ok(text) => match serde_json::from_str(&text) {
+            Ok(cfg) => {
+                println!("Konfiguration geladen: {path}");
+                cfg
+            }
+            Err(e) => {
+                eprintln!("WARNUNG: {path} ist kein gültiges JSON ({e}) – Server läuft offen");
+                FileConfig::default()
+            }
+        },
+        Err(_) => {
+            println!("Keine {path} gefunden – Server läuft offen (jeder darf beitreten)");
+            FileConfig::default()
+        }
+    };
+    let seed = file.seed.as_ref().and_then(|v| match v {
+        serde_json::Value::Number(n) => n.as_u64().map(|n| n as u32),
+        serde_json::Value::String(s) => Some(
+            s.parse::<u32>().unwrap_or_else(|_| hash_seed(s)),
+        ),
+        _ => None,
+    });
+    let mut whitelist: HashMap<String, String> = file
+        .whitelist
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(k, v)| (k.to_lowercase(), v))
+        .collect();
+    let mut open = file.open.unwrap_or(true);
+
+    // Env-Überschreibungen (für Render & Co., wo man keine Dateien pflegt):
+    //   WHITELIST="fionn:pass1,anna:pass2"  -> Einträge ergänzen, Server implizit zu
+    //   SERVER_OPEN=true|false              -> expliziter Modus (gewinnt immer)
+    if let Ok(v) = std::env::var("WHITELIST") {
+        for pair in v.split(',') {
+            if let Some((n, p)) = pair.split_once(':') {
+                let (n, p) = (n.trim().to_lowercase(), p.trim());
+                if !n.is_empty() && !p.is_empty() {
+                    whitelist.insert(n, p.to_string());
+                }
+            }
+        }
+        open = false;
+    }
+    if let Ok(v) = std::env::var("SERVER_OPEN") {
+        open = matches!(v.to_lowercase().as_str(), "true" | "1" | "yes" | "ja");
+    }
+
+    (ServerConfig { open, whitelist }, seed)
+}
+
+fn hash_seed(s: &str) -> u32 {
+    // Gleiche Text-Seed-Hash-Logik wie das Client-Menü (menu.js)
+    let mut seed: u32 = 0;
+    for ch in s.chars() {
+        seed = seed.wrapping_mul(31).wrapping_add(ch as u32);
+    }
+    seed
+}
 
 // ============ Protokoll ============
 
@@ -92,17 +183,19 @@ enum ServerMsg<'a> {
 struct Player {
     info: PlayerInfo,
     account: String, // Schlüssel in Hub.accounts (Name in Kleinbuchstaben)
-    tx: mpsc::UnboundedSender<Message>,
+    tx: mpsc::UnboundedSender<String>,
 }
 
-// Account: Name (case-insensitiv) + frei gewähltes Passwort beim ersten Join.
-// Der Zustand (Inventar, Position, HP …) ist ein vom Client definiertes JSON-Blob.
+// Account: Name (case-insensitiv) + Passwort (bei Whitelist aus der Config,
+// sonst beim ersten Join frei gewählt). Der Zustand (Inventar, Position, HP …)
+// ist ein vom Client definiertes JSON-Blob.
 struct Account {
     pass: String,
     state: Option<serde_json::Value>,
 }
 
 struct Hub {
+    config: ServerConfig,
     seed: u32,
     time: f64,
     next_pid: u32,
@@ -113,8 +206,9 @@ struct Hub {
 }
 
 impl Hub {
-    fn new(seed: u32) -> Self {
+    fn new(config: ServerConfig, seed: u32) -> Self {
         Hub {
+            config,
             seed,
             time: 0.05, // Morgen, wie ein frischer Singleplayer-Start
             next_pid: 0,
@@ -165,12 +259,18 @@ impl Hub {
             if Some(*pid) == except {
                 continue;
             }
-            let _ = p.tx.send(Message::Text(text.clone()));
+            let _ = p.tx.send(text.clone());
         }
     }
 }
 
 type SharedHub = Arc<Mutex<Hub>>;
+
+#[derive(Clone)]
+struct AppState {
+    hub: SharedHub,
+    client_dir: PathBuf,
+}
 
 // ============ Main ============
 
@@ -179,16 +279,34 @@ async fn main() {
     let port = std::env::var("PORT").unwrap_or_else(|_| "8080".to_string());
     let addr = format!("0.0.0.0:{port}");
 
-    let seed = match std::env::var("WORLD_SEED") {
-        Ok(s) => s.parse::<u32>().unwrap_or_else(|_| hash_seed(&s)),
-        Err(_) => SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos() ^ d.as_secs() as u32)
-            .unwrap_or(1337),
-    };
+    let (config, cfg_seed) = load_config();
+    let seed = cfg_seed
+        .or_else(|| {
+            std::env::var("WORLD_SEED")
+                .ok()
+                .map(|s| s.parse::<u32>().unwrap_or_else(|_| hash_seed(&s)))
+        })
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() ^ d.as_secs() as u32)
+                .unwrap_or(1337)
+        });
 
-    let hub: SharedHub = Arc::new(Mutex::new(Hub::new(seed)));
-    println!("ClaudeMC Hub · Seed {seed} · lauscht auf {addr}");
+    let client_dir = find_client_dir();
+    let mode = if config.open {
+        "offen".to_string()
+    } else {
+        format!("Whitelist ({} Spieler)", config.whitelist.len())
+    };
+    println!("ClaudeMC Server · Seed {seed} · Modus: {mode}");
+    match &client_dir {
+        Some(dir) => println!("Spiel-Client wird ausgeliefert aus: {}", dir.display()),
+        None => println!("Kein Client-Ordner gefunden (CLIENT_DIR setzen) – nur WebSocket aktiv"),
+    }
+    println!("Lausche auf {addr} – Spieler verbinden sich im Browser via http://<deine-ip>:{port}/");
+
+    let hub: SharedHub = Arc::new(Mutex::new(Hub::new(config, seed)));
 
     // Snapshot-/Zeit-Task: 10 Hz Positions-Broadcast, ~0.1 s Zeitfortschritt
     {
@@ -222,39 +340,95 @@ async fn main() {
         });
     }
 
-    let listener = TcpListener::bind(&addr).await.expect("Failed to bind address");
-    while let Ok((stream, _)) = listener.accept().await {
-        tokio::spawn(handle_connection(stream, hub.clone()));
-    }
-}
-
-fn hash_seed(s: &str) -> u32 {
-    // Gleiche Text-Seed-Hash-Logik wie das Client-Menü (menu.js)
-    let mut seed: u32 = 0;
-    for ch in s.chars() {
-        seed = seed.wrapping_mul(31).wrapping_add(ch as u32);
-    }
-    seed
-}
-
-// ============ Verbindung ============
-
-async fn handle_connection(stream: TcpStream, hub: SharedHub) {
-    let ws_stream = match accept_async(stream).await {
-        Ok(ws) => ws,
-        Err(e) => {
-            eprintln!("WebSocket handshake failed: {e}");
-            return;
-        }
+    let state = AppState {
+        hub,
+        client_dir: client_dir.unwrap_or_else(|| PathBuf::from("../client")),
     };
-    let (mut write, mut read) = ws_stream.split();
+    let app = Router::new().fallback(root_handler).with_state(state);
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .expect("Failed to bind address");
+    axum::serve(listener, app).await.expect("Server failed");
+}
+
+// Client-Ordner: CLIENT_DIR, sonst ./client bzw. ../client (Repo-Layout)
+fn find_client_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("CLIENT_DIR") {
+        let p = PathBuf::from(dir);
+        return p.is_dir().then_some(p);
+    }
+    for cand in ["client", "../client"] {
+        let p = PathBuf::from(cand);
+        if p.join("index.html").is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+// Ein Handler für alles: WebSocket-Upgrade (beliebiger Pfad) oder statische Datei
+async fn root_handler(
+    State(st): State<AppState>,
+    ws: Option<WebSocketUpgrade>,
+    uri: Uri,
+) -> Response {
+    if let Some(ws) = ws {
+        return ws.on_upgrade(move |socket| handle_ws(socket, st.hub));
+    }
+    serve_static(&st.client_dir, uri.path()).await
+}
+
+fn content_type(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" | "mcmeta" => "application/json",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        "ogg" => "audio/ogg",
+        "mp3" => "audio/mpeg",
+        "wasm" => "application/wasm",
+        "txt" => "text/plain; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+async fn serve_static(dir: &Path, path: &str) -> Response {
+    let rel = path.trim_start_matches('/');
+    let rel = if rel.is_empty() { "index.html" } else { rel };
+    // Pfad-Traversal verhindern
+    if rel.split('/').any(|seg| seg == ".." || seg.is_empty() || seg.contains('\\')) {
+        return (StatusCode::FORBIDDEN, "Ungültiger Pfad").into_response();
+    }
+    match tokio::fs::read(dir.join(rel)).await {
+        Ok(bytes) => (
+            [(header::CONTENT_TYPE, content_type(rel))],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            "Nicht gefunden. Läuft der Server neben dem client/-Ordner (oder ist CLIENT_DIR gesetzt)?",
+        )
+            .into_response(),
+    }
+}
+
+// ============ WebSocket-Verbindung ============
+
+async fn handle_ws(socket: WebSocket, hub: SharedHub) {
+    let (mut write, mut read) = socket.split();
 
     // Ausgehender Kanal: alle Sende-Pfade (Hub-Broadcasts + direkte Antworten)
     // laufen über diese Queue, ein Writer-Task leert sie in den Socket.
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let writer = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if write.send(msg).await.is_err() {
+        while let Some(text) = rx.recv().await {
+            if write.send(WsMessage::Text(text)).await.is_err() {
                 break;
             }
         }
@@ -264,8 +438,8 @@ async fn handle_connection(stream: TcpStream, hub: SharedHub) {
 
     while let Some(msg) = read.next().await {
         let text = match msg {
-            Ok(Message::Text(t)) => t,
-            Ok(Message::Close(_)) | Err(_) => break,
+            Ok(WsMessage::Text(t)) => t,
+            Ok(WsMessage::Close(_)) | Err(_) => break,
             _ => continue,
         };
         let parsed: ClientMsg = match serde_json::from_str(&text) {
@@ -282,8 +456,15 @@ async fn handle_connection(stream: TcpStream, hub: SharedHub) {
                 let account = name.to_lowercase();
                 let mut h = hub.lock().await;
 
-                // Auth: Account entsteht beim ersten Join; danach schützt das Passwort den Namen.
-                let deny = if h.players.values().any(|p| p.account == account) {
+                // Zutritt: Whitelist (falls aktiv), kein Doppel-Login, Account-Passwort.
+                // Auf Whitelist-Servern gilt das Whitelist-Passwort als Account-Passwort.
+                let deny = if !h.config.open && !h.config.whitelist.contains_key(&account) {
+                    Some("Du stehst nicht auf der Whitelist dieses Servers.")
+                } else if !h.config.open
+                    && h.config.whitelist.get(&account).map(|p| p != &pass).unwrap_or(true)
+                {
+                    Some("Falsches Passwort (Whitelist).")
+                } else if h.players.values().any(|p| p.account == account) {
                     Some("Dieser Name spielt gerade schon.")
                 } else {
                     match h.accounts.get(&account) {
@@ -295,7 +476,7 @@ async fn handle_connection(stream: TcpStream, hub: SharedHub) {
                 };
                 if let Some(msg) = deny {
                     if let Ok(t) = serde_json::to_string(&ServerMsg::Deny { msg }) {
-                        let _ = tx.send(Message::Text(t));
+                        let _ = tx.send(t);
                     }
                     break;
                 }
@@ -320,7 +501,7 @@ async fn handle_connection(stream: TcpStream, hub: SharedHub) {
                     state,
                 };
                 if let Ok(t) = serde_json::to_string(&welcome) {
-                    let _ = tx.send(Message::Text(t));
+                    let _ = tx.send(t);
                 }
 
                 h.broadcast(&ServerMsg::PJoin { pid, name: &name }, None);
@@ -405,7 +586,7 @@ async fn handle_connection(stream: TcpStream, hub: SharedHub) {
                     continue;
                 }
                 if let Ok(t) = serde_json::to_string(&ServerMsg::Hit { from: pid, dmg, kx, kz }) {
-                    let _ = tgt.tx.send(Message::Text(t));
+                    let _ = tgt.tx.send(t);
                 }
             }
             ClientMsg::Died { by } => {
@@ -422,7 +603,7 @@ async fn handle_connection(stream: TcpStream, hub: SharedHub) {
             }
             ClientMsg::Ping { ts } => {
                 if let Ok(t) = serde_json::to_string(&ServerMsg::Pong { ts }) {
-                    let _ = tx.send(Message::Text(t));
+                    let _ = tx.send(t);
                 }
             }
         }
