@@ -29,6 +29,8 @@ Clients generieren es deterministisch aus dem Seed.
 | `{"t":"set","d":…,"x":…,"y":…,"z":…,"id":…}` | Blockänderung |
 | `{"t":"chat","msg":"…"}` | Chat-Nachricht (max. 200 Zeichen) |
 | `{"t":"state","data":{…}}` | Spielerzustand (Inventar, Position, HP …) für den Account speichern; der Client sendet alle 10 s sowie beim Verlassen |
+| `{"t":"hit","target":…,"dmg":…,"kx":…,"kz":…,"r":…}` | PvP-Treffer melden; Server prüft Dimension + Reichweite (Nahkampf 8, Pfeil `r` 80 Blöcke), deckelt `dmg` auf 12 und relayt nur ans Ziel |
+| `{"t":"died","by":…}` | Vom Opfer gemeldeter Tod → Server broadcastet die Todesmeldung |
 | `{"t":"ping","ts":…}` | Keepalive/Latenz |
 
 **Server → Client**
@@ -40,6 +42,8 @@ Clients generieren es deterministisch aus dem Seed.
 | `snap` | Positions-Snapshot aller Spieler, 10 Hz |
 | `set` | Blockänderung eines Mitspielers (`by` = pid) |
 | `chat` | Chat-Broadcast (`pid`, `name`, `msg`) an alle inkl. Absender |
+| `hit` | Eingehender PvP-Treffer (`from`, `dmg`, `kx`, `kz`); das Ziel wendet den Schaden inkl. eigener Rüstungsberechnung an |
+| `sys` | System-Chatzeile (z. B. „⚔ A wurde von B besiegt") |
 | `pjoin` / `pleave` | Spieler kommt/geht |
 | `time` | Weltzeit-Sync (~alle 10 s) |
 | `pong` | Antwort auf `ping` |

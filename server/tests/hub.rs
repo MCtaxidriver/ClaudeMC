@@ -172,3 +172,46 @@ async fn accounts_state_and_chat() {
     assert_eq!(w2["state"]["hp"], 17);
     assert_eq!(w2["state"]["inv"][0][1], 64);
 }
+
+#[tokio::test]
+async fn pvp_hit_relay_and_death_message() {
+    let port = 39253;
+    let server = Command::new(env!("CARGO_BIN_EXE_claudemc-ws"))
+        .env("PORT", port.to_string())
+        .env("WORLD_SEED", "9")
+        .spawn()
+        .unwrap();
+    let _guard = ServerGuard(server);
+
+    let mut a = connect(port).await;
+    send(&mut a, json!({"t":"join","name":"Att"})).await;
+    let pid_a = recv_type(&mut a, "welcome").await["pid"].as_u64().unwrap();
+    let mut b = connect(port).await;
+    send(&mut b, json!({"t":"join","name":"Def"})).await;
+    let pid_b = recv_type(&mut b, "welcome").await["pid"].as_u64().unwrap();
+
+    // Beide nah beieinander in der Overworld
+    send(&mut a, json!({"t":"pos","d":"over","x":0.0,"y":45.0,"z":0.0,"yw":0.0,"pt":0.0})).await;
+    send(&mut b, json!({"t":"pos","d":"over","x":3.0,"y":45.0,"z":0.0,"yw":0.0,"pt":0.0})).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // Nahkampftreffer: Schaden wird gedeckelt (20 -> 12) und nur ans Ziel relayt
+    send(&mut a, json!({"t":"hit","target":pid_b,"dmg":20.0,"kx":6.0,"kz":0.0})).await;
+    let hit = recv_type(&mut b, "hit").await;
+    assert_eq!(hit["from"].as_u64().unwrap(), pid_a);
+    assert_eq!(hit["dmg"], 12.0);
+
+    // Zu weit weg für Nahkampf -> verworfen; als Fernkampf (r) -> erlaubt
+    send(&mut b, json!({"t":"pos","d":"over","x":40.0,"y":45.0,"z":0.0,"yw":0.0,"pt":0.0})).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    send(&mut a, json!({"t":"hit","target":pid_b,"dmg":5.0,"kx":0.0,"kz":0.0})).await;
+    send(&mut a, json!({"t":"hit","target":pid_b,"dmg":6.0,"kx":0.0,"kz":0.0,"r":true})).await;
+    let hit2 = recv_type(&mut b, "hit").await;
+    assert_eq!(hit2["dmg"], 6.0, "Nahkampf-Hit über 8 Blöcke muss verworfen werden");
+
+    // Todesmeldung als System-Broadcast an alle
+    send(&mut b, json!({"t":"died","by":pid_a})).await;
+    let sys = recv_type(&mut a, "sys").await;
+    let msg = sys["msg"].as_str().unwrap();
+    assert!(msg.contains("Def") && msg.contains("Att") && msg.contains("besiegt"), "{msg}");
+}

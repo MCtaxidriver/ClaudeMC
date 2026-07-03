@@ -755,6 +755,7 @@ function pickMob() {
 function tryAttack() {
   const p = game.player;
   if (p.attackTimer > 0) return false;
+  if (game.mp && tryAttackPlayer()) return true;
   const mob = pickMob();
   if (!mob) return false;
   p.attackTimer = ATTACK_COOLDOWN;
@@ -1751,6 +1752,83 @@ function handleChatKey(e) {
   chatInputEl.textContent = chatBuffer;
 }
 
+// --- PvP ---
+let mpLastHit = null; // { pid, t } – letzter Angreifer (für die Todesmeldung)
+
+// Mitspieler im Fadenkreuz (analog pickMob, gegen die interpolierte Position).
+// Anders als beim Block-Raycast blockieren nur SOLIDE Blöcke die Sichtlinie –
+// hohes Gras, Blumen oder Fackeln dürfen einen Treffer nicht verhindern.
+function pickRemotePlayer() {
+  camera.getWorldDirection(dirVec);
+  let best = null, bestT = Infinity;
+  for (const rp of remotePlayers.values()) {
+    if (rp.dim !== game.dimName || !rp.cur) continue;
+    const hw = PLAYER_WIDTH / 2 + 0.1;
+    const c = rp.cur;
+    const t = rayAABB(
+      camera.position.x, camera.position.y, camera.position.z,
+      dirVec.x, dirVec.y, dirVec.z,
+      { x: c.x - hw, y: c.y, z: c.z - hw },
+      { x: c.x + hw, y: c.y + PLAYER_HEIGHT + 0.1, z: c.z + hw });
+    if (t !== null && t < bestT && t <= REACH) { bestT = t; best = rp; }
+  }
+  if (!best) return null;
+  for (let s = 0.3; s < bestT; s += 0.25) {
+    const id = curWorld().getBlock(
+      Math.floor(camera.position.x + dirVec.x * s),
+      Math.floor(camera.position.y + dirVec.y * s),
+      Math.floor(camera.position.z + dirVec.z * s));
+    if (BLOCK_INFO[id].solid) return null;
+  }
+  return best;
+}
+
+// Nahkampf gegen einen Mitspieler; true wenn getroffen (Schaden wendet das Ziel an)
+function tryAttackPlayer() {
+  const p = game.player;
+  const rp = pickRemotePlayer();
+  if (!rp) return false;
+  p.attackTimer = ATTACK_COOLDOWN;
+  const tool = heldToolInfo();
+  const dmg = tool && tool.damage ? tool.damage : 1;
+  const dx = rp.cur.x - p.pos.x, dz = rp.cur.z - p.pos.z;
+  const d = Math.hypot(dx, dz) || 1;
+  net.sendHit(rp.pid, dmg, dx / d * 6, dz / d * 6);
+  rp.flash();
+  S.mobHurt();
+  damageHeld(1);
+  p.exhaustion += 0.1;
+  return true;
+}
+
+// Eigene Pfeile gegen Mitspieler prüfen (Mob-Treffer macht die Arrow-Klasse selbst)
+function pvpArrowTick() {
+  for (const e of curDim().entities) {
+    if (!(e instanceof Arrow) || e.dead || !e.fromPlayer) continue;
+    for (const rp of remotePlayers.values()) {
+      if (rp.dim !== game.dimName || !rp.cur) continue;
+      const hw = PLAYER_WIDTH / 2 + 0.15;
+      if (Math.abs(e.pos.x - rp.cur.x) < hw && Math.abs(e.pos.z - rp.cur.z) < hw &&
+          e.pos.y > rp.cur.y - 0.1 && e.pos.y < rp.cur.y + PLAYER_HEIGHT + 0.2) {
+        const d = Math.hypot(e.vel.x, e.vel.z) || 1;
+        net.sendHit(rp.pid, 6, e.vel.x / d * 5, e.vel.z / d * 5, true);
+        rp.flash();
+        S.mobHurt();
+        e.dead = true;
+        break;
+      }
+    }
+  }
+}
+
+// Eingehender Treffer: Schaden lokal anwenden (inkl. eigener Rüstungsberechnung)
+function onRemoteHit(m) {
+  if (!game || !game.mp || game.player.dead) return;
+  mpLastHit = { pid: m.from, t: performance.now() };
+  game.player.hurt(m.dmg, m.kx, m.kz);
+  renderStatus();
+}
+
 // --- Spielerzustand (Account-Persistenz auf dem Server) ---
 let mpStateTimer = 10;
 
@@ -1848,6 +1926,15 @@ function startMultiplayer(name, pass) {
       });
       game.mp = true;
       mpStateTimer = 10;
+      mpLastHit = null;
+      // Todesmeldung in den Chat aller Spieler (PvP-Kill oder Umgebungstod)
+      const origDeath = game.player.onDeath;
+      game.player.onDeath = () => {
+        const byPvp = mpLastHit && performance.now() - mpLastHit.t < 8000;
+        net.sendDied(byPvp ? mpLastHit.pid : net.pid);
+        mpLastHit = null;
+        origDeath();
+      };
       for (const p of w.players) addRemotePlayer(p.pid, p.name, p);
       addChatLine(w.players.length
         ? `Verbunden – ${w.players.length} Mitspieler online. [T] öffnet den Chat.`
@@ -1857,6 +1944,8 @@ function startMultiplayer(name, pass) {
     onSet: m => applyRemoteSet(m.d, m.x, m.y, m.z, m.id),
     onSnap: onSnapshot,
     onChat: m => addChatLine(m),
+    onHit: onRemoteHit,
+    onSys: msg => addChatLine(msg, true),
     onJoin: m => {
       addRemotePlayer(m.pid, m.name, null);
       addChatLine(`${m.name} ist beigetreten`, true);
@@ -2153,6 +2242,7 @@ function tick(dt, now) {
   if (game.mp) {
     net.tick(dt, game.dimName, p.pos.x, p.pos.y, p.pos.z, p.yaw, p.pitch);
     for (const rp of remotePlayers.values()) rp.update(dt);
+    pvpArrowTick();
     mpStateTimer -= dt;
     if (mpStateTimer <= 0) {
       mpStateTimer = 10;

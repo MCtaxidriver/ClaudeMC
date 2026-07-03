@@ -36,6 +36,17 @@ enum ClientMsg {
     Set { d: String, x: i32, y: i32, z: i32, id: u16 },
     Chat { msg: String },
     State { data: serde_json::Value },
+    // PvP: Angreifer meldet Treffer; r = Fernkampf (Pfeil, grössere Reichweite)
+    Hit {
+        target: u32,
+        dmg: f64,
+        kx: f64,
+        kz: f64,
+        #[serde(default)]
+        r: bool,
+    },
+    // Vom Opfer gemeldet: Tod (by = Angreifer-pid oder eigene pid bei Umgebungstod)
+    Died { by: u32 },
     Ping { ts: f64 },
 }
 
@@ -69,6 +80,8 @@ enum ServerMsg<'a> {
     Snap { p: Vec<(u32, &'a str, f64, f64, f64, f64, f64)> },
     Set { d: &'a str, x: i32, y: i32, z: i32, id: u16, by: u32 },
     Chat { pid: u32, name: &'a str, msg: &'a str },
+    Hit { from: u32, dmg: f64, kx: f64, kz: f64 },
+    Sys { msg: &'a str },
     Deny { msg: &'a str },
     Time { v: f64 },
     Pong { ts: f64 },
@@ -366,6 +379,46 @@ async fn handle_connection(stream: TcpStream, hub: SharedHub) {
                 if let Some(acc) = h.accounts.get_mut(&account) {
                     acc.state = Some(data);
                 }
+            }
+            ClientMsg::Hit { target, dmg, kx, kz, r } => {
+                let Some(pid) = my_pid else { continue };
+                if pid == target || !dmg.is_finite() || dmg <= 0.0 {
+                    continue;
+                }
+                let dmg = dmg.min(12.0);
+                let kx = if kx.is_finite() { kx.clamp(-12.0, 12.0) } else { 0.0 };
+                let kz = if kz.is_finite() { kz.clamp(-12.0, 12.0) } else { 0.0 };
+                let h = hub.lock().await;
+                let (Some(att), Some(tgt)) = (h.players.get(&pid), h.players.get(&target))
+                else {
+                    continue;
+                };
+                // Plausibilität: gleiche Dimension, Reichweite (Nahkampf 8, Pfeil 80)
+                if att.info.d != tgt.info.d {
+                    continue;
+                }
+                let dist = ((att.info.x - tgt.info.x).powi(2)
+                    + (att.info.y - tgt.info.y).powi(2)
+                    + (att.info.z - tgt.info.z).powi(2))
+                .sqrt();
+                if dist > if r { 80.0 } else { 8.0 } {
+                    continue;
+                }
+                if let Ok(t) = serde_json::to_string(&ServerMsg::Hit { from: pid, dmg, kx, kz }) {
+                    let _ = tgt.tx.send(Message::Text(t));
+                }
+            }
+            ClientMsg::Died { by } => {
+                let Some(pid) = my_pid else { continue };
+                let h = hub.lock().await;
+                let Some(victim) = h.players.get(&pid) else { continue };
+                let msg = match h.players.get(&by) {
+                    Some(killer) if by != pid => {
+                        format!("⚔ {} wurde von {} besiegt", victim.info.name, killer.info.name)
+                    }
+                    _ => format!("☠ {} ist gestorben", victim.info.name),
+                };
+                h.broadcast(&ServerMsg::Sys { msg: &msg }, None);
             }
             ClientMsg::Ping { ts } => {
                 if let Ok(t) = serde_json::to_string(&ServerMsg::Pong { ts }) {

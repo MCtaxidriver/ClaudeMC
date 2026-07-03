@@ -61,6 +61,8 @@ export class Net {
       case 'pjoin': if (msg.pid !== this.pid) h.onJoin?.(msg); break;
       case 'pleave': h.onLeave?.(msg); break;
       case 'chat': h.onChat?.(msg); break;
+      case 'hit': h.onHit?.(msg); break;
+      case 'sys': h.onSys?.(msg.msg); break;
       case 'deny':
         markSettled();
         h.onError?.(msg.msg);
@@ -84,6 +86,17 @@ export class Net {
   sendChat(msg) {
     if (!this.active) return;
     this.send({ t: 'chat', msg });
+  }
+
+  // PvP: Treffer melden; r = Fernkampf (Pfeil)
+  sendHit(target, dmg, kx, kz, r = false) {
+    if (!this.active) return;
+    this.send({ t: 'hit', target, dmg, kx, kz, r });
+  }
+
+  sendDied(by) {
+    if (!this.active) return;
+    this.send({ t: 'died', by });
   }
 
   sendState(data) {
