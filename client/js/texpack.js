@@ -155,17 +155,18 @@ const ITEM_SOURCES = {
   [I.BREAD]: ['bread'],
 };
 
-// Entity-Skins (Pfad relativ zu textures/)
+// Entity-Skins (Pfad relativ zu textures/); overlay wird über die Basis gezeichnet
+// (z. B. Schafwolle über die geschorene Haut – gleiche UV-Layouts).
 const ENTITY_SOURCES = {
-  zombie: ['entity/zombie/zombie'],
-  skeleton: ['entity/skeleton/skeleton'],
-  creeper: ['entity/creeper/creeper'],
-  villager: ['entity/villager/villager'],
-  enderman: ['entity/enderman/enderman'],
-  cow: ['entity/cow/cow'],
-  sheep: ['entity/sheep/sheep'],
-  golem: ['entity/iron_golem/iron_golem', 'entity/iron_golem'],
-  blaze: ['entity/blaze'],
+  zombie: { names: ['entity/zombie/zombie'] },
+  skeleton: { names: ['entity/skeleton/skeleton'] },
+  creeper: { names: ['entity/creeper/creeper'] },
+  villager: { names: ['entity/villager/villager'] },
+  enderman: { names: ['entity/enderman/enderman'] },
+  cow: { names: ['entity/cow/cow_temperate', 'entity/cow/cow'] },
+  sheep: { names: ['entity/sheep/sheep'], overlay: ['entity/sheep/sheep_wool', 'entity/sheep/sheep_fur'] },
+  golem: { names: ['entity/iron_golem/iron_golem', 'entity/iron_golem'] },
+  blaze: { names: ['entity/blaze'] },
 };
 
 let packActive = false;
@@ -257,10 +258,17 @@ export async function loadTexturePack(atlasCanvas) {
     loaded++;
   });
 
-  const entityJobs = Object.entries(ENTITY_SOURCES).map(async ([type, names]) => {
-    const img = await loadFirst([''], names);
+  const entityJobs = Object.entries(ENTITY_SOURCES).map(async ([type, src]) => {
+    const img = await loadFirst([''], src.names);
     if (!img) return;
-    entitySkins.set(type, { canvas: toCanvas(img) });
+    const canvas = toCanvas(img);
+    if (src.overlay) {
+      const ov = await loadFirst([''], src.overlay);
+      if (ov && ov.width === canvas.width && ov.height === canvas.height) {
+        canvas.getContext('2d').drawImage(ov, 0, 0);
+      }
+    }
+    entitySkins.set(type, { canvas });
     loaded++;
   });
 

@@ -755,6 +755,7 @@ function pickMob() {
 function tryAttack() {
   const p = game.player;
   if (p.attackTimer > 0) return false;
+  if (game.mp && tryAttackPlayer()) return true;
   const mob = pickMob();
   if (!mob) return false;
   p.attackTimer = ATTACK_COOLDOWN;
@@ -1663,6 +1664,7 @@ function saveGame() {
 
 function quitToMenu() {
   saveGame();
+  sendMpState();
   netCleanup();
   for (const name of ['over', 'nether', 'end']) {
     const d = game.dims[name];
@@ -1691,6 +1693,161 @@ function netCleanup() {
   if (net.ws || net.active) net.disconnect();
   for (const rp of remotePlayers.values()) rp.dispose();
   remotePlayers.clear();
+  closeChat();
+  chatLogEl.innerHTML = '';
+}
+
+// --- Chat ---
+const chatLogEl = el('chat-log');
+const chatInputRow = el('chat-input-row');
+const chatInputEl = el('chat-input');
+let chatOpen = false;
+let chatBuffer = '';
+
+function addChatLine(entry, system = false) {
+  const div = document.createElement('div');
+  div.className = 'chat-line' + (system ? ' system' : '');
+  if (system) {
+    div.textContent = entry;
+  } else {
+    const n = document.createElement('span');
+    n.className = 'chat-name';
+    n.textContent = entry.name + ': ';
+    div.appendChild(n);
+    div.appendChild(document.createTextNode(entry.msg));
+  }
+  chatLogEl.appendChild(div);
+  while (chatLogEl.children.length > 8) chatLogEl.firstChild.remove();
+  setTimeout(() => {
+    div.classList.add('fading');
+    setTimeout(() => div.remove(), 1100);
+  }, 12000);
+}
+
+function openChat() {
+  chatOpen = true;
+  chatBuffer = '';
+  chatInputEl.textContent = '';
+  chatInputRow.classList.remove('hidden');
+}
+
+function closeChat() {
+  chatOpen = false;
+  chatInputRow.classList.add('hidden');
+}
+
+// Eigene Tastenerfassung statt <input>: der Pointer-Lock bleibt aktiv.
+function handleChatKey(e) {
+  if (e.code === 'Escape') { closeChat(); return; }
+  if (e.code === 'Enter' || e.code === 'NumpadEnter') {
+    const msg = chatBuffer.trim();
+    if (msg) net.sendChat(msg);
+    closeChat();
+    return;
+  }
+  if (e.code === 'Backspace') chatBuffer = chatBuffer.slice(0, -1);
+  else if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey && chatBuffer.length < 200) {
+    chatBuffer += e.key;
+  }
+  chatInputEl.textContent = chatBuffer;
+}
+
+// --- PvP ---
+let mpLastHit = null; // { pid, t } – letzter Angreifer (für die Todesmeldung)
+
+// Mitspieler im Fadenkreuz (analog pickMob, gegen die interpolierte Position).
+// Anders als beim Block-Raycast blockieren nur SOLIDE Blöcke die Sichtlinie –
+// hohes Gras, Blumen oder Fackeln dürfen einen Treffer nicht verhindern.
+function pickRemotePlayer() {
+  camera.getWorldDirection(dirVec);
+  let best = null, bestT = Infinity;
+  for (const rp of remotePlayers.values()) {
+    if (rp.dim !== game.dimName || !rp.cur) continue;
+    const hw = PLAYER_WIDTH / 2 + 0.1;
+    const c = rp.cur;
+    const t = rayAABB(
+      camera.position.x, camera.position.y, camera.position.z,
+      dirVec.x, dirVec.y, dirVec.z,
+      { x: c.x - hw, y: c.y, z: c.z - hw },
+      { x: c.x + hw, y: c.y + PLAYER_HEIGHT + 0.1, z: c.z + hw });
+    if (t !== null && t < bestT && t <= REACH) { bestT = t; best = rp; }
+  }
+  if (!best) return null;
+  for (let s = 0.3; s < bestT; s += 0.25) {
+    const id = curWorld().getBlock(
+      Math.floor(camera.position.x + dirVec.x * s),
+      Math.floor(camera.position.y + dirVec.y * s),
+      Math.floor(camera.position.z + dirVec.z * s));
+    if (BLOCK_INFO[id].solid) return null;
+  }
+  return best;
+}
+
+// Nahkampf gegen einen Mitspieler; true wenn getroffen (Schaden wendet das Ziel an)
+function tryAttackPlayer() {
+  const p = game.player;
+  const rp = pickRemotePlayer();
+  if (!rp) return false;
+  p.attackTimer = ATTACK_COOLDOWN;
+  const tool = heldToolInfo();
+  const dmg = tool && tool.damage ? tool.damage : 1;
+  const dx = rp.cur.x - p.pos.x, dz = rp.cur.z - p.pos.z;
+  const d = Math.hypot(dx, dz) || 1;
+  net.sendHit(rp.pid, dmg, dx / d * 6, dz / d * 6);
+  rp.flash();
+  S.mobHurt();
+  damageHeld(1);
+  p.exhaustion += 0.1;
+  return true;
+}
+
+// Eigene Pfeile gegen Mitspieler prüfen (Mob-Treffer macht die Arrow-Klasse selbst)
+function pvpArrowTick() {
+  for (const e of curDim().entities) {
+    if (!(e instanceof Arrow) || e.dead || !e.fromPlayer) continue;
+    for (const rp of remotePlayers.values()) {
+      if (rp.dim !== game.dimName || !rp.cur) continue;
+      const hw = PLAYER_WIDTH / 2 + 0.15;
+      if (Math.abs(e.pos.x - rp.cur.x) < hw && Math.abs(e.pos.z - rp.cur.z) < hw &&
+          e.pos.y > rp.cur.y - 0.1 && e.pos.y < rp.cur.y + PLAYER_HEIGHT + 0.2) {
+        const d = Math.hypot(e.vel.x, e.vel.z) || 1;
+        net.sendHit(rp.pid, 6, e.vel.x / d * 5, e.vel.z / d * 5, true);
+        rp.flash();
+        S.mobHurt();
+        e.dead = true;
+        break;
+      }
+    }
+  }
+}
+
+// Eingehender Treffer: Schaden lokal anwenden (inkl. eigener Rüstungsberechnung)
+function onRemoteHit(m) {
+  if (!game || !game.mp || game.player.dead) return;
+  mpLastHit = { pid: m.from, t: performance.now() };
+  game.player.hurt(m.dmg, m.kx, m.kz);
+  renderStatus();
+}
+
+// --- Spielerzustand (Account-Persistenz auf dem Server) ---
+let mpStateTimer = 10;
+
+function collectMpState() {
+  return {
+    dim: game.dimName,
+    spawn: game.spawn,
+    player: {
+      pos: { ...game.player.pos },
+      hp: game.player.hp,
+      hunger: game.player.hunger,
+      inv: game.inventory.serialize(),
+      selected,
+    },
+  };
+}
+
+function sendMpState() {
+  if (game && game.mp && net.active && !game.player.dead) net.sendState(collectMpState());
 }
 
 // Remote-Spieler in die Szene seiner Dimension hängen (falls lokal erzeugt)
@@ -1751,34 +1908,52 @@ function applyRemoteSet(d, x, y, z, id) {
   }
 }
 
-function startMultiplayer(name) {
+function startMultiplayer(name, pass) {
   const status = el('mp-status');
   status.textContent = 'Verbinde mit Server…';
-  net.connect(SERVER_URL, name, {
+  net.connect(SERVER_URL, name, pass, {
     onWelcome: w => {
       status.textContent = '';
+      const st = w.state || {};
       startGame(undefined, 'survival', {
         seed: w.seed,
         time: w.time,
         edits: w.edits,
         name: 'Multiplayer',
+        dim: st.dim,
+        spawn: st.spawn,
+        player: st.player,
       });
       game.mp = true;
+      mpStateTimer = 10;
+      mpLastHit = null;
+      // Todesmeldung in den Chat aller Spieler (PvP-Kill oder Umgebungstod)
+      const origDeath = game.player.onDeath;
+      game.player.onDeath = () => {
+        const byPvp = mpLastHit && performance.now() - mpLastHit.t < 8000;
+        net.sendDied(byPvp ? mpLastHit.pid : net.pid);
+        mpLastHit = null;
+        origDeath();
+      };
       for (const p of w.players) addRemotePlayer(p.pid, p.name, p);
-      toast(w.players.length
-        ? `Verbunden – ${w.players.length} Mitspieler online`
-        : 'Verbunden – du bist der erste Spieler');
+      addChatLine(w.players.length
+        ? `Verbunden – ${w.players.length} Mitspieler online. [T] öffnet den Chat.`
+        : 'Verbunden – du bist der erste Spieler. [T] öffnet den Chat.', true);
+      if (st.player) addChatLine('Willkommen zurück! Dein Inventar wurde wiederhergestellt.', true);
     },
     onSet: m => applyRemoteSet(m.d, m.x, m.y, m.z, m.id),
     onSnap: onSnapshot,
+    onChat: m => addChatLine(m),
+    onHit: onRemoteHit,
+    onSys: msg => addChatLine(msg, true),
     onJoin: m => {
       addRemotePlayer(m.pid, m.name, null);
-      toast(`${m.name} ist beigetreten`);
+      addChatLine(`${m.name} ist beigetreten`, true);
     },
     onLeave: m => {
       const rp = remotePlayers.get(m.pid);
       if (rp) {
-        toast(`${rp.name} hat das Spiel verlassen`);
+        addChatLine(`${rp.name} hat das Spiel verlassen`, true);
         rp.dispose();
         remotePlayers.delete(m.pid);
       }
@@ -1843,7 +2018,7 @@ document.addEventListener('mousedown', unlockAudio);
 document.addEventListener('keydown', unlockAudio);
 
 canvas.addEventListener('mousedown', e => {
-  if (appState !== 'playing' || !game || game.player.dead) return;
+  if (appState !== 'playing' || !game || game.player.dead || chatOpen) return;
   if (e.button === 0) {
     viewModel.swing();
     if (game.mode === 'creative') {
@@ -1876,6 +2051,17 @@ let creativeMineTimer = 0;
 
 window.addEventListener('keydown', e => {
   if (e.code === 'Space') e.preventDefault();
+  // Multiplayer-Chat fängt alle Tasten ab, solange er offen ist
+  if (chatOpen) {
+    e.preventDefault();
+    handleChatKey(e);
+    return;
+  }
+  if (game && game.mp && appState === 'playing' && !game.player.dead && e.code === 'KeyT' && !e.repeat) {
+    e.preventDefault();
+    openChat();
+    return;
+  }
   if (e.code === 'F3') { e.preventDefault(); debugMode = (debugMode + 1) % 3; renderDebug(); return; }
   if (!game) return;
 
@@ -1927,7 +2113,7 @@ window.addEventListener('keyup', e => {
   if (action && action in game.player.keys) game.player.keys[action] = false;
 });
 window.addEventListener('wheel', e => {
-  if (appState === 'playing') selectSlot(selected + Math.sign(e.deltaY));
+  if (appState === 'playing' && !chatOpen) selectSlot(selected + Math.sign(e.deltaY));
 });
 
 window.addEventListener('resize', () => {
@@ -1937,7 +2123,12 @@ window.addEventListener('resize', () => {
   if (viewModel) viewModel.resize();
 });
 
-window.addEventListener('beforeunload', () => { if (game) saveGame(); });
+window.addEventListener('beforeunload', () => {
+  if (game) {
+    saveGame();
+    sendMpState();
+  }
+});
 
 // Pause-Menü-Buttons
 el('btn-resume').addEventListener('click', () => {
@@ -1956,6 +2147,7 @@ el('btn-quit').addEventListener('click', quitToMenu);
 // Multiplayer-Menü
 el('btn-open-mp').addEventListener('click', () => {
   el('mp-name').value = localStorage.getItem('cc-mp-name') || '';
+  el('mp-pass').value = localStorage.getItem('cc-mp-pass') || '';
   el('mp-status').textContent = '';
   menus.show('menu-mp');
 });
@@ -1965,8 +2157,10 @@ el('btn-mp-back').addEventListener('click', () => {
 });
 el('btn-mp-join').addEventListener('click', () => {
   const name = el('mp-name').value.trim() || 'Steve';
+  const pass = el('mp-pass').value;
   localStorage.setItem('cc-mp-name', name);
-  startMultiplayer(name);
+  localStorage.setItem('cc-mp-pass', pass);
+  startMultiplayer(name, pass);
 });
 el('btn-dead-quit').addEventListener('click', quitToMenu);
 el('btn-respawn').addEventListener('click', () => {
@@ -2048,6 +2242,12 @@ function tick(dt, now) {
   if (game.mp) {
     net.tick(dt, game.dimName, p.pos.x, p.pos.y, p.pos.z, p.yaw, p.pitch);
     for (const rp of remotePlayers.values()) rp.update(dt);
+    pvpArrowTick();
+    mpStateTimer -= dt;
+    if (mpStateTimer <= 0) {
+      mpStateTimer = 10;
+      sendMpState();
+    }
   }
   camera.position.set(p.pos.x, p.pos.y + EYE_HEIGHT, p.pos.z);
   camera.rotation.x = p.pitch;
@@ -2184,6 +2384,7 @@ window.GAME = {
   teleport(x, y, z) { game.player.pos = { x, y, z }; game.player.vel = { x: 0, y: 0, z: 0 }; },
   net,
   remotePlayers,
-  joinMultiplayer(name = 'Steve') { startMultiplayer(name); },
+  joinMultiplayer(name = 'Steve', pass = '') { startMultiplayer(name, pass); },
+  sendChat(msg) { net.sendChat(msg); },
   I, B,
 };
